@@ -1,0 +1,8 @@
+litellm
+pandas
+pydantic>=2
+python-dotenv
+tqdm
+
+# dev
+pytest

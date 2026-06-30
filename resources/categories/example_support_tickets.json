@@ -1,0 +1,33 @@
+{
+  "categories": [
+    {
+      "name": "intent",
+      "description": "What the customer is primarily trying to accomplish with this message.",
+      "labels": [
+        {"value": "bug_report", "description": "The customer is reporting something that is broken or behaving incorrectly."},
+        {"value": "feature_request", "description": "The customer is asking for new functionality that does not yet exist."},
+        {"value": "how_to", "description": "The customer is asking how to do something with the existing product."},
+        {"value": "billing", "description": "The message concerns payments, invoices, refunds, or subscriptions."},
+        {"value": "complaint", "description": "The customer is expressing dissatisfaction without a specific actionable request."}
+      ]
+    },
+    {
+      "name": "sentiment",
+      "description": "The overall emotional tone the customer expresses.",
+      "labels": [
+        {"value": "positive", "description": "The customer is satisfied, appreciative, or friendly."},
+        {"value": "neutral", "description": "The message is factual or transactional with no strong emotion."},
+        {"value": "negative", "description": "The customer is frustrated, angry, or disappointed."}
+      ]
+    },
+    {
+      "name": "urgency",
+      "description": "How time-sensitive the request appears to be.",
+      "labels": [
+        {"value": "low", "description": "No time pressure indicated."},
+        {"value": "medium", "description": "The customer would like a response soon but is not blocked."},
+        {"value": "high", "description": "The customer is blocked or describes a business-critical impact."}
+      ]
+    }
+  ]
+}
