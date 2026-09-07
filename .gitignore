@@ -23,3 +23,6 @@ output/
 .DS_Store
 .idea/
 .vscode/
+
+# spec-* critique trails (one-time audit artifacts, not durable docs)
+spec/*-critique-*.md
