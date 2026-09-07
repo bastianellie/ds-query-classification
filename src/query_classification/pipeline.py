@@ -43,6 +43,13 @@ def classify_csv(
     output_path = Path(output_path) if output_path else input_path
     category_names = [cat.name for cat in categories]
 
+    if column in category_names:
+        raise ValueError(
+            f"Category name '{column}' collides with the text column being "
+            f"classified. Rename the category or choose a different --column; "
+            f"otherwise the source text would be overwritten before classification."
+        )
+
     df = pd.read_csv(input_path)
     if column not in df.columns:
         raise ValueError(
@@ -54,6 +61,19 @@ def classify_csv(
         if col not in df.columns:
             df[col] = None
 
+    # When resuming into a separate --output file, seed already-classified
+    # category columns from the prior output before deciding what's left to do.
+    if restore and output_path.exists() and output_path.resolve() != input_path.resolve():
+        prior = pd.read_csv(output_path)
+        if len(prior) != len(df):
+            raise ValueError(
+                f"Cannot restore from '{output_path}': it has {len(prior)} rows, "
+                f"but '{input_path}' has {len(df)} rows."
+            )
+        for col in category_names:
+            if col in prior.columns:
+                df[col] = prior[col]
+
     work_idx = df.index
 
     if restore:
@@ -62,7 +82,7 @@ def classify_csv(
     else:
         df.loc[work_idx, category_names] = None
 
-    if limit:
+    if limit is not None:
         work_idx = work_idx[:limit]
 
     total = len(work_idx)

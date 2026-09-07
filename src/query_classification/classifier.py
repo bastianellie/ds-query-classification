@@ -58,6 +58,8 @@ class Classifier:
         retry_delay: float = 5.0,
         api_base: str | None = None,
     ) -> None:
+        if max_retries < 1:
+            raise ValueError(f"max_retries must be >= 1, got {max_retries}")
         self.model_id = model_id
         self.system_prompt = system_prompt
         self.classification_model = classification_model

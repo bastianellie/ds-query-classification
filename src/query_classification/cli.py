@@ -17,6 +17,7 @@ from query_classification.prompts import build_system_prompt
 from query_classification.resources import (
     DEFAULT_CATEGORIES_FILE,
     DEFAULT_SYSTEM_PROMPT_FILE,
+    check_default_resources_available,
 )
 from query_classification.schema import build_classification_model
 
@@ -108,41 +109,46 @@ def main() -> None:
     _quiet_logging()
     args = build_parser().parse_args()
 
-    categories = load_categories(args.categories)
-    classification_model = build_classification_model(categories)
+    try:
+        uses_bundled_defaults = (
+            args.categories == str(DEFAULT_CATEGORIES_FILE) or args.system_prompt is None
+        )
+        if uses_bundled_defaults:
+            check_default_resources_available()
 
-    system_prompt_file = (
-        Path(args.system_prompt) if args.system_prompt else DEFAULT_SYSTEM_PROMPT_FILE
-    )
-    task_description = (
-        Path(args.task_description).read_text() if args.task_description else None
-    )
-    extra_prompt = Path(args.extra_prompt).read_text() if args.extra_prompt else None
-    system_prompt = build_system_prompt(
-        classification_model,
-        system_prompt_file,
-        task_description=task_description,
-        extra_prompt=extra_prompt,
-    )
+        categories = load_categories(args.categories)
+        classification_model = build_classification_model(categories)
 
-    if not args.output:
-        print(
-            "\n"
-            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-            "  WARNING: no --output specified. The input file will be\n"
-            f"  OVERWRITTEN in place: {args.input}\n"
-            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        system_prompt_file = (
+            Path(args.system_prompt) if args.system_prompt else DEFAULT_SYSTEM_PROMPT_FILE
+        )
+        task_description = (
+            Path(args.task_description).read_text() if args.task_description else None
+        )
+        extra_prompt = Path(args.extra_prompt).read_text() if args.extra_prompt else None
+        system_prompt = build_system_prompt(
+            classification_model,
+            system_prompt_file,
+            task_description=task_description,
+            extra_prompt=extra_prompt,
         )
 
-    classifier = Classifier(
-        model_id=args.model,
-        system_prompt=system_prompt,
-        classification_model=classification_model,
-        max_retries=args.retries,
-        api_base=args.api_base,
-    )
+        if not args.output:
+            print(
+                "\n"
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                "  WARNING: no --output specified. The input file will be\n"
+                f"  OVERWRITTEN in place: {args.input}\n"
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+            )
 
-    try:
+        classifier = Classifier(
+            model_id=args.model,
+            system_prompt=system_prompt,
+            classification_model=classification_model,
+            max_retries=args.retries,
+            api_base=args.api_base,
+        )
         classify_csv(
             input_path=args.input,
             column=args.column,
@@ -153,7 +159,7 @@ def main() -> None:
             limit=args.limit,
             workers=args.workers,
         )
-    except ValueError as e:
+    except (ValueError, FileNotFoundError) as e:
         print(f"Error: {e}")
         sys.exit(1)
 

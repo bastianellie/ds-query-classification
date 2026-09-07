@@ -6,6 +6,7 @@ asked for structured output that exactly matches the user-defined categories.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any
 
 from pydantic import BaseModel, Field, create_model
@@ -19,6 +20,13 @@ def build_classification_model(categories: list[Category]) -> type[BaseModel]:
     Each category becomes a field holding a list of 1-3 label strings, ordered
     by strength of evidence.
     """
+    duplicates = [name for name, count in Counter(cat.name for cat in categories).items() if count > 1]
+    if duplicates:
+        raise ValueError(
+            f"Duplicate category name(s): {duplicates}. Each category's `name` "
+            f"becomes a distinct output field/column and must be unique."
+        )
+
     fields: dict[str, Any] = {}
     for cat in categories:
         label_docs = "; ".join(
