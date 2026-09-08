@@ -507,6 +507,19 @@ def test_induce_category_round_trips():
     assert Category.model_validate(outcome.category.model_dump()) == outcome.category
 
 
+def test_induce_single_call_sees_all_labels_grouped():
+    df = _train_df([("a1", "neg"), ("a2", "neg"), ("b1", "neu"), ("c1", "pos"), ("c2", "pos")])
+    classifier = FakeInductionClassifier(response=_induction_response(["neg", "neu", "pos"]))
+    induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    assert len(classifier.calls) == 1
+    sent = classifier.calls[0]
+    for label in ("neg", "neu", "pos"):
+        assert f'"{label}"' in sent
+
+
 # ---------------------------------------------------------------------------
 # schema.py / prompts.py additions
 # ---------------------------------------------------------------------------
