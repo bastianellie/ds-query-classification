@@ -1,0 +1,37 @@
+{
+  "categories": [
+    {
+      "name": "beliefs",
+      "description": "Beliefs refer to assumptions, expectations, or predictions about the opponent, the situation, or likely outcomes. Beliefs concern what the player thinks is true, likely, or possible, regardless of whether these beliefs are accurate.",
+      "labels": [
+        {"value": "overconfidence", "description": "The player expresses excessive confidence in their own success, judgment, prediction, or strategic ability."},
+        {"value": "source", "description": "The player’s expectations are influenced by the perceived source or identity of the opponent (e.g., human vs AI, expert vs novice, in-group vs out-group). This includes stereotypes, prior literature, reputation, or assumptions about capabilities."},
+        {"value": "similarity", "description": "The player assumes that others have preferences, strategies, or intentions similar to their own (“projection” or homophily-based reasoning)."},
+        {"value": "trust", "description": "The player expresses expectations about whether the opponent will cooperate, reciprocate, defect, exploit, or compete."}
+      ]
+    },
+    {
+      "name": "preferences",
+      "description": "Preferences refer to the outcomes, principles, or social goals the player values or wants to achieve. Preferences concern what the player cares about, independent of strategic reasoning.",
+      "labels": [
+        {"value": "joy_of_winning", "description": "The player values outperforming or defeating the opponent beyond material payoff."},
+        {"value": "spite", "description": "The player values reducing another player’s payoff even at personal cost."},
+        {"value": "risk_aversion", "description": "The player prefers safer outcomes with lower uncertainty, even if expected payoff is lower."},
+        {"value": "risk_taking", "description": "The player prefers safer outcomes with lower uncertainty, even if expected payoff is lower."},
+        {"value": "balanced_risk/reward_gain", "description": "The player explicitly weighs potential gains against potential losses or uncertainty when choosing actions."},
+        {"value": "no_harm_principle", "description": "The player avoids actions that directly harm others, even when harmful actions would increase personal payoff."},
+        {"value": "loss_aversion", "description": "Potential losses psychologically weigh more heavily than equivalent gains."},
+        {"value": "social_preference", "description": "The player values outcomes affecting others in addition to personal payoff."},
+        {"value": "inequality_aversion", "description": "The player dislikes unequal outcomes, especially when disadvantaged relative to others."}
+      ]
+    },
+    {
+      "name": "rationality",
+      "description": "Rationality refers to whether the reasoning explicitly uses strategic payoff-based logic to justify the decision, including considering incentives, best responses, trade-offs, or expected outcomes and, when applicable, reasoning consistent with payoff-maximizing Nash equilibrium play.",
+      "labels": [
+        {"value": "yes", "description": "The reasoning explicitly uses incentives, payoffs, strategic responses, equilibrium logic, or outcome maximization to justify the decision."},
+        {"value": "no", "description": "The reasoning does not primarily rely on strategic payoff logic."}
+      ]
+    }
+  ]
+}
