@@ -109,6 +109,72 @@ python classify.py \
 | `--critic-model` | LiteLLM model id for the `--critics` Critic role (default: `--model`). |
 | `--reconciler-model` | LiteLLM model id for the `--critics` Reconciler role (default: `--model`). |
 
+## Experiment runner
+
+`experiment.py` (a separate entry point from `classify.py`) runs a full
+train-to-classified-test-set experiment against a local CSV pair or a
+HuggingFace Hub dataset, with three subcommands:
+
+```bash
+# Induce categories.json from a labeled train split
+python experiment.py induce \
+  --train-file data/train.csv --text-column text --label-column label \
+  --category-name sentiment --run-dir runs/1
+
+# Classify a test split with an existing categories.json
+python experiment.py classify \
+  --test-file data/test.csv --text-column text --label-column label \
+  --categories runs/1/categories.json --run-dir runs/2
+
+# Both, in one invocation
+python experiment.py run \
+  --train-file data/train.csv --test-file data/test.csv \
+  --text-column text --label-column label --category-name sentiment \
+  --run-dir runs/3
+```
+
+Equivalent to `python -m query_classification.experiment ...`. All of
+`classify.py`'s classifier-configuration flags are available on
+`classify`/`run` (`--model`, `--critics`, `--sampling-runs`, ...); `induce`/
+`run` additionally take `--seed`, `--examples-per-label`,
+`--max-example-chars`, `--max-prompt-chars`, and `--induction-model`.
+
+For a HuggingFace dataset instead of local files, install the optional
+`hf` extra (`pip install '.[hf]'`, requires `datasets>=4`) and pass
+`--hf-dataset owner/name` (plus `--hf-config`/`--hf-revision`/
+`--hf-train-split`/`--hf-test-split` as needed) in place of
+`--train-file`/`--test-file`.
+
+**Every run writes a self-contained run directory** (`--run-dir`, required):
+`categories.json` (induced, or a verbatim copy of a supplied one),
+`train.csv`/`test.csv` (materialized, filtered, needed columns only),
+`test_classified.csv`, `induction_prompt.txt` and `sampled_examples.json`
+(when inducing), and `run_config.json` — a full reproducibility/audit record
+(dataset provenance, resolved models, flags, label values, excluded/
+unclassified row positions, package versions), written last with a terminal
+`status`. The runner refuses to write into a non-empty `--run-dir` unless
+`--overwrite` is passed, and `--overwrite` only ever replaces these known
+artifact filenames — never the directory itself or any other file in it.
+
+**Deliberate divergence from `classify.py`:** in plain (non-`--critics`) mode,
+`classify.py` always allows label invention (`cli.py`'s
+`allow_new_labels = args.allow_new_labels if args.critics else True`). The
+experiment runner instead honors `--allow-new-labels` (default **off**) in
+**both** classifier modes, so an experiment's plain-mode output stays within
+the induced/supplied closed vocabulary — comparing induced-vs-hand-written
+categories, or plain-vs-`--critics` mode, requires that gold labels can
+actually match a prediction.
+
+**Data egress note:** the `induce` subcommand sends sampled **train** text to
+whichever model `--induction-model` (or `--model`) resolves to; `classify`/
+`run` send **test** text to `--model` (and, under `--critics`, to
+`--critic-model`/`--reconciler-model` too). Point any of these at a different
+provider than your default only if you intend that split's text to go there.
+As with `classify.py`, output CSV cells are not sanitized against
+spreadsheet-formula injection if opened in a spreadsheet application — treat
+`test_classified.csv` as you would any other untrusted CSV before opening it
+that way.
+
 ## Defining categories
 
 ```json
@@ -140,10 +206,13 @@ src/query_classification/
   classifier.py   # single-text LLM classification (Classifier)
   pipeline.py     # CSV batch loop (restore / limit / incremental save)
   debate.py       # --critics: sampling, consensus voting, Critic/Reconciler debate
-  cli.py          # argparse entry point
+  cli.py          # argparse entry point (classify.py)
+  dataset_io.py   # local/HF dataset loading, label normalization, row filtering
+  induction.py    # category induction: sampling, one LLM call, reconciliation
+  experiment.py   # argparse entry point (experiment.py) — induce/classify/run
 resources/
   categories/     # example category definitions
-  prompts/        # system/critic/reconciler prompt templates + example task descriptions
+  prompts/        # system/critic/reconciler/induction prompt templates + example task descriptions
 tests/            # unit tests for the offline building blocks
 ```
 
