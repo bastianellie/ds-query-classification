@@ -21,6 +21,9 @@ dependencies = [
 dev = [
     "pytest",
 ]
+hf = [
+    "datasets>=4",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

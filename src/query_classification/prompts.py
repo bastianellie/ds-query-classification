@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from query_classification.resources import (
     DEFAULT_CRITIC_PROMPT_FILE,
+    DEFAULT_INDUCTION_PROMPT_FILE,
     DEFAULT_RECONCILER_PROMPT_FILE,
     DEFAULT_SYSTEM_PROMPT_FILE,
 )
@@ -96,3 +97,17 @@ def build_reconciler_prompt(
         category_description=category_description,
         label_options=label_options,
     )
+
+
+def build_induction_prompt(
+    system_prompt_file: str | Path = DEFAULT_INDUCTION_PROMPT_FILE,
+) -> str:
+    """Render the induction system prompt.
+
+    Unlike ``build_critic_prompt``/``build_reconciler_prompt``, this takes no
+    category/label parameters: the induction system prompt describes the task
+    once, generically, while the actual labels/examples for a given dataset are
+    per-call data assembled into the user message by a different module. The
+    template has no placeholders, so no ``.format()`` call is needed here.
+    """
+    return Path(system_prompt_file).read_text()

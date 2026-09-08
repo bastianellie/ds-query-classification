@@ -115,6 +115,31 @@ def build_reconciler_model(category: Category) -> type[BaseModel]:
     return ReconcilerVerdict
 
 
+def build_induction_model() -> type[BaseModel]:
+    """Build the output schema for the category-induction call.
+
+    Unlike its three siblings above, this model is **fixed**, not parameterized
+    by category/labels: induction is exactly the process of inferring the label
+    set, so there is nothing yet to parameterize it with. The result is a
+    ``list`` of label/description pairs rather than a dynamic field per label,
+    because label values are dataset-chosen strings that routinely aren't valid
+    Python/Pydantic identifiers (``"very negative"``, ``"class 1"``), and a list
+    entry is comparable for exact reconciliation later, whereas an unexpected
+    object key would be silently dropped by Pydantic's default extra-field
+    handling.
+    """
+
+    class InductionLabel(BaseModel):
+        label: str
+        description: str
+
+    class InductionResult(BaseModel):
+        category_description: str
+        labels: list[InductionLabel]
+
+    return InductionResult
+
+
 def schema_description(model: type[BaseModel]) -> str:
     """Produce a human-readable summary of the model fields for the prompt."""
     lines = [
