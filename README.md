@@ -47,6 +47,32 @@ python classify.py \
 
 Equivalent to `python -m query_classification ...`.
 
+### Critics mode: self-consistency sampling + Critic/Reconciler debate
+
+`--critics` samples each row multiple times, votes on the result per category,
+and escalates categories without consensus to a Critic (devil's advocate) and,
+if it raises a real challenge, a Reconciler — adding a full audit trail to the
+output CSV:
+
+```bash
+python classify.py \
+  --input data/queries.csv \
+  --column text \
+  --output output/queries_classified.csv \
+  --categories resources/categories/example_support_tickets.json \
+  --critics \
+  --sampling-runs 5 \
+  --consensus-threshold 4
+```
+
+This roughly multiplies LLM call volume by `--sampling-runs` per row (plus one
+Critic call, and one Reconciler call, per category that doesn't reach
+consensus) — size `--workers` down accordingly for large inputs. `--critic-
+model`/`--reconciler-model` can each point at a different LiteLLM model than
+`--model`, which means the same row text is routed to whichever provider each
+model resolves to; make sure that's intentional before pointing them at a
+different provider than your main classification calls.
+
 ### Reproducing the original decision-classification setup
 
 ```bash
@@ -67,12 +93,21 @@ python classify.py \
 | `-o, --output` | Output CSV file. **Omitting it overwrites the input in place.** |
 | `--categories` | Categories JSON file (default: bundled example). |
 | `--model` | LiteLLM model id (default: `azure/gpt-5-chat`). |
+| `--api-base` | Override the API endpoint/base URL (default: resolved from the first of `LITELLM_API_BASE`, `AZURE_API_BASE`, `AZURE_OPENAI_ENDPOINT`, `OPENAI_BASE_URL`, `OPENAI_API_BASE` that is set). |
 | `--system-prompt` | Override the system prompt template. |
 | `--task-description` | Text file describing the task/domain (`{task_description}` slot). |
 | `--extra-prompt` | Text file with extra ad-hoc instructions, appended to the prompt. |
 | `--limit N` | Only classify the first N rows. |
 | `--restore` | Skip rows that already have labels; resume a previous run. |
 | `--retries N` | Retry attempts per row on LLM error (default: 3). |
+| `--workers N` | Concurrent worker threads for LLM calls (default: 8). |
+| `--critics` | Enable self-consistency sampling + Critic/Reconciler debate mode (see below). |
+| `--sampling-runs N` | Independent samples per row under `--critics` (default: 5). |
+| `--sampling-temperature T` | Sampling temperature for `--critics` (default: 0.7). |
+| `--consensus-threshold N` | Vote count (out of `--sampling-runs`) needed to bypass debate under `--critics` (default: 4). |
+| `--allow-new-labels` | Under `--critics`, allow suggesting `"none - <new label>"` instead of only predefined labels/`"none"`. |
+| `--critic-model` | LiteLLM model id for the `--critics` Critic role (default: `--model`). |
+| `--reconciler-model` | LiteLLM model id for the `--critics` Reconciler role (default: `--model`). |
 
 ## Defining categories
 
@@ -104,10 +139,11 @@ src/query_classification/
   prompts.py      # render the system prompt
   classifier.py   # single-text LLM classification (Classifier)
   pipeline.py     # CSV batch loop (restore / limit / incremental save)
+  debate.py       # --critics: sampling, consensus voting, Critic/Reconciler debate
   cli.py          # argparse entry point
 resources/
   categories/     # example category definitions
-  prompts/        # system prompt template + example task descriptions
+  prompts/        # system/critic/reconciler prompt templates + example task descriptions
 tests/            # unit tests for the offline building blocks
 ```
 

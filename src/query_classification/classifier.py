@@ -57,6 +57,7 @@ class Classifier:
         max_retries: int = 3,
         retry_delay: float = 5.0,
         api_base: str | None = None,
+        temperature: float | None = None,
     ) -> None:
         if max_retries < 1:
             raise ValueError(f"max_retries must be >= 1, got {max_retries}")
@@ -68,6 +69,7 @@ class Classifier:
         # Resolve from the common endpoint env vars when not given explicitly.
         # Kept as None (never "") so litellm can fall back to its own resolution.
         self.api_base = api_base if api_base is not None else resolve_api_base()
+        self.temperature = temperature
 
     def _completion_kwargs(self, messages: list[dict]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"model": self.model_id, "messages": messages}
@@ -75,6 +77,10 @@ class Classifier:
         # attempt an empty endpoint and raise instead of using its own defaults.
         if self.api_base:
             kwargs["api_base"] = self.api_base
+        # Only pass temperature when actually set, so every existing call site that
+        # doesn't set it keeps relying on the provider's own default temperature.
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         return kwargs
 
     def _complete(self, messages: list[dict]) -> str:

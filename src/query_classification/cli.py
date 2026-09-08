@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -13,13 +14,21 @@ from dotenv import load_dotenv
 from query_classification.categories import load_categories
 from query_classification.classifier import Classifier
 from query_classification.pipeline import classify_csv
-from query_classification.prompts import build_system_prompt
+from query_classification.prompts import (
+    build_critic_prompt,
+    build_reconciler_prompt,
+    build_system_prompt,
+)
 from query_classification.resources import (
     DEFAULT_CATEGORIES_FILE,
     DEFAULT_SYSTEM_PROMPT_FILE,
     check_default_resources_available,
 )
-from query_classification.schema import build_classification_model
+from query_classification.schema import (
+    build_classification_model,
+    build_critic_model,
+    build_reconciler_model,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,7 +100,64 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         metavar="N",
         help="Number of concurrent worker threads for LLM calls (default: 8). "
-        "Use 1 to disable parallelism.",
+        "Use 1 to limit row-level concurrency to one row at a time (with "
+        "--critics, that row's own sampling calls still run concurrently with "
+        "each other, so this no longer means zero concurrency overall).",
+    )
+    parser.add_argument(
+        "--critics",
+        action="store_true",
+        help="Enable self-consistency sampling + Critic/Reconciler debate mode: "
+        "each row is sampled --sampling-runs times and voted on; categories "
+        "without consensus are argued out by a Critic and, if challenged, "
+        "settled by a Reconciler. Adds a full audit trail to the output CSV. "
+        "Roughly multiplies LLM call volume by --sampling-runs per row.",
+    )
+    parser.add_argument(
+        "--sampling-runs",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Number of independent classification samples per row under "
+        "--critics (default: 5).",
+    )
+    parser.add_argument(
+        "--sampling-temperature",
+        type=float,
+        default=0.7,
+        metavar="T",
+        help="Sampling temperature for the --critics self-consistency samples "
+        "(default: 0.7). Ignored without --critics.",
+    )
+    parser.add_argument(
+        "--consensus-threshold",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Minimum vote count (out of --sampling-runs) for a category to "
+        "bypass debate under --critics (default: 4).",
+    )
+    parser.add_argument(
+        "--allow-new-labels",
+        action="store_true",
+        help="Under --critics, allow the sampling classifier to suggest "
+        '"none - <new label>" instead of only the predefined labels or plain '
+        '"none". Off by default so votes converge on a small, fixed set of '
+        "options.",
+    )
+    parser.add_argument(
+        "--critic-model",
+        metavar="MODEL",
+        help="LiteLLM model id for the --critics Critic role. Defaults to "
+        "--model. May route the same row text to a different provider than "
+        "--model.",
+    )
+    parser.add_argument(
+        "--reconciler-model",
+        metavar="MODEL",
+        help="LiteLLM model id for the --critics Reconciler role. Defaults to "
+        "--model. May route the same row text to a different provider than "
+        "--model.",
     )
     return parser
 
@@ -111,13 +177,31 @@ def main() -> None:
 
     try:
         uses_bundled_defaults = (
-            args.categories == str(DEFAULT_CATEGORIES_FILE) or args.system_prompt is None
+            args.categories == str(DEFAULT_CATEGORIES_FILE)
+            or args.system_prompt is None
+            or args.critics  # Critic/Reconciler role prompts are always bundled.
         )
         if uses_bundled_defaults:
             check_default_resources_available()
 
+        if args.critics and not math.isfinite(args.sampling_temperature):
+            raise ValueError(
+                f"--sampling-temperature must be a finite number, got "
+                f"{args.sampling_temperature}"
+            )
+        if args.critics and args.sampling_temperature < 0:
+            raise ValueError(
+                f"--sampling-temperature must be >= 0, got {args.sampling_temperature}"
+            )
+
         categories = load_categories(args.categories)
-        classification_model = build_classification_model(categories)
+        # Under --critics, the sampling classifier's schema/prompt must both be
+        # built with the same allow_new_labels value for the constraint to
+        # actually apply (a schema-only or prompt-only fix is incomplete).
+        allow_new_labels = args.allow_new_labels if args.critics else True
+        classification_model = build_classification_model(
+            categories, allow_new_labels=allow_new_labels
+        )
 
         system_prompt_file = (
             Path(args.system_prompt) if args.system_prompt else DEFAULT_SYSTEM_PROMPT_FILE
@@ -131,6 +215,7 @@ def main() -> None:
             system_prompt_file,
             task_description=task_description,
             extra_prompt=extra_prompt,
+            allow_new_labels=allow_new_labels,
         )
 
         if not args.output:
@@ -148,7 +233,41 @@ def main() -> None:
             classification_model=classification_model,
             max_retries=args.retries,
             api_base=args.api_base,
+            temperature=args.sampling_temperature if args.critics else None,
         )
+
+        critic_classifiers = None
+        reconciler_classifiers = None
+        if args.critics:
+            critic_classifiers = {
+                cat.name: Classifier(
+                    model_id=args.critic_model or args.model,
+                    system_prompt=build_critic_prompt(
+                        cat.name,
+                        cat.description,
+                        "; ".join(f'"{lbl.value}": {lbl.description}' for lbl in cat.labels),
+                    ),
+                    classification_model=build_critic_model(cat),
+                    max_retries=args.retries,
+                    api_base=args.api_base,
+                )
+                for cat in categories
+            }
+            reconciler_classifiers = {
+                cat.name: Classifier(
+                    model_id=args.reconciler_model or args.model,
+                    system_prompt=build_reconciler_prompt(
+                        cat.name,
+                        cat.description,
+                        "; ".join(f'"{lbl.value}": {lbl.description}' for lbl in cat.labels),
+                    ),
+                    classification_model=build_reconciler_model(cat),
+                    max_retries=args.retries,
+                    api_base=args.api_base,
+                )
+                for cat in categories
+            }
+
         classify_csv(
             input_path=args.input,
             column=args.column,
@@ -158,6 +277,12 @@ def main() -> None:
             restore=args.restore,
             limit=args.limit,
             workers=args.workers,
+            critics=args.critics,
+            critic_classifiers=critic_classifiers,
+            reconciler_classifiers=reconciler_classifiers,
+            sampling_runs=args.sampling_runs,
+            consensus_threshold=args.consensus_threshold,
+            allow_new_labels=allow_new_labels,
         )
     except (ValueError, FileNotFoundError) as e:
         print(f"Error: {e}")

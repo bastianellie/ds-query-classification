@@ -3,7 +3,7 @@ You are an expert classifier.
 {task_description}
 
 Your task is to classify each input text according to the categories defined below. For each category, assign between one and three labels following these mandatory rules:
-- You must assign at least one label per category. If none of the specific labels apply, use "none" alone, or "none - <new label>" to suggest a concept not already present in the predefined set. Never use "none - <existing label>": if an existing label fits, assign it directly.
+- You must assign at least one label per category. {invention_policy}
 - You may assign up to three labels if multiple aspects are clearly and distinctly present in the text.
 - Include additional labels only when there is clear evidence for them in the text.
 - When assigning multiple labels, order them strictly by the strength of evidence: the label most prominently or frequently supported by the text must appear first, followed by the others in decreasing order of prominence.
