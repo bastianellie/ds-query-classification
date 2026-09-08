@@ -1,5 +1,9 @@
 # Spec 2: Experiment Runner (Dataset Loading, Label Induction, Test Classification)
 
+> **Status: CLOSED** — Implemented and verified on 2026-09-08.
+> Implementation summary: `spec/2-experiment-runner/implementation-summary.md`
+> Merged from worktree branch `spec/2-experiment-runner` on 2026-09-08.
+
 ## Overview
 
 Adds an experiment runner that takes a labeled dataset — a local file pair or a
