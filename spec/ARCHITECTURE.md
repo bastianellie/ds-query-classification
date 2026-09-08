@@ -20,12 +20,17 @@ graph TD
     categories[categories.py] --> schema[schema.py]
     categories --> pipeline[pipeline.py]
     categories --> init["__init__.py"]
+    categories --> debate[debate.py]
     classifier[classifier.py] --> pipeline
     classifier --> init
+    classifier --> debate
     resources[resources.py] --> prompts[prompts.py]
     schema --> prompts
     schema --> init
+    schema --> debate
     prompts --> init
+    prompts --> debate
+    debate --> pipeline
     pipeline --> init
     categories --> cli[cli.py]
     classifier --> cli
@@ -46,7 +51,8 @@ graph TD
 | `src/query_classification/schema.py` | Dynamically build the `ClassificationResult` Pydantic model from categories | `categories.py` | `prompts.py`, `pipeline.py`, `cli.py` |
 | `src/query_classification/resources.py` | Compute `PROJECT_ROOT` + default resource paths | stdlib only | any sibling module |
 | `src/query_classification/prompts.py` | Render the system prompt template | `schema.py`, `resources.py` | `pipeline.py`, `cli.py` |
-| `src/query_classification/pipeline.py` | Threaded CSV batch loop (`classify_csv`): restore/limit/incremental save | `categories.py`, `classifier.py` | `schema.py`, `prompts.py`, `cli.py` |
+| `src/query_classification/pipeline.py` | Threaded CSV batch loop (`classify_csv`): restore/limit/incremental save | `categories.py`, `classifier.py`, `debate.py` | `schema.py`, `prompts.py`, `cli.py` |
+| `src/query_classification/debate.py` | Per-row self-consistency sampling, consensus voting, and Critic/Reconciler debate orchestration for `--critics` mode | `categories.py`, `classifier.py`, `schema.py`, `prompts.py` | `pipeline.py`, `cli.py` |
 | `src/query_classification/cli.py` | argparse entry point; wires every module together | `categories.py`, `classifier.py`, `pipeline.py`, `prompts.py`, `resources.py`, `schema.py` | (top of the graph — nothing above it) |
 | `src/query_classification/__init__.py` | Re-exports the public API | `categories.py`, `schema.py`, `prompts.py`, `classifier.py`, `pipeline.py` (exactly these 5 — verified by reading its import block; it does **not** import `cli.py` or `resources.py`) | `cli.py` |
 | `src/query_classification/__main__.py` | `python -m query_classification` | `cli.py` | — |
@@ -66,9 +72,10 @@ graph TD
 ## Invariants
 
 ### INV-1: Internal dependency graph is one-directional and acyclic
-- **Rule:** `categories.py` and `classifier.py` never import any sibling module; `schema.py` depends only on `categories.py`; `prompts.py` depends only on `schema.py`+`resources.py`; `pipeline.py` depends only on `categories.py`+`classifier.py`; `__init__.py` depends on exactly those 5 modules; `cli.py` is the only module allowed to import all 6.
-- **Why:** keeps the building blocks independently testable/reusable (this is exactly what `tests/test_building_blocks.py` exercises) and keeps the LLM/threading/CSV concerns decoupled from schema/prompt construction.
-- **Evidence:** `schema.py:13`, `prompts.py:21-22`, `pipeline.py:16-17`, `cli.py:13-21`, `__init__.py:14-18`; `classifier.py` and `categories.py` have no `from query_classification...` imports.
+- **Rule:** `categories.py` and `classifier.py` never import any sibling module; `schema.py` depends only on `categories.py`; `prompts.py` depends only on `schema.py`+`resources.py`; `debate.py` depends only on `categories.py`+`classifier.py`+`schema.py`+`prompts.py`; `pipeline.py` depends only on `categories.py`+`classifier.py`+`debate.py`; `__init__.py` depends on exactly the original 5 modules (`debate.py` is not re-exported — see INV-7); `cli.py` is the only module allowed to import all 7.
+- **Why:** keeps the building blocks independently testable/reusable (this is exactly what `tests/test_building_blocks.py` exercises) and keeps the LLM/threading/CSV concerns decoupled from schema/prompt construction. `debate.py` composes the schema/prompt builders for `--critics` mode without `pipeline.py` needing to depend on `schema.py`/`prompts.py` directly, preserving that separation.
+- **Evidence:** `schema.py:13`, `prompts.py:21-22`, `pipeline.py:16-17`, `cli.py:13-21`, `__init__.py:14-18`; `classifier.py` and `categories.py` have no `from query_classification...` imports. `debate.py` in practice imports only `categories.py`+`classifier.py` (a subset of what's authorized) — see `spec/1-initial-classification-with-critics/implementation-summary.md`'s Deviations section.
+- *(amended by `spec/1-initial-classification-with-critics/ADR.md` ADR-001, 2026-09-08)*
 
 ### INV-2: All bundled default paths are computed once, in `resources.py`
 - **Rule:** `resources.py` is the single source of truth for locating `resources/` (categories, prompts). No other module recomputes a path into `resources/` itself.
@@ -95,10 +102,11 @@ graph TD
 - **Why:** stated explicitly in a code comment; this is also what keeps output row order tied to input order regardless of LLM completion order. This does **not** imply `Classifier` itself is safe to call concurrently from multiple threads in general — that's a property of the LiteLLM client, which isn't verified here.
 - **Evidence:** `pipeline.py:74-93` (comment above the `ThreadPoolExecutor` block, and the `df.at[idx, ...]` writes only inside the `for future in as_completed(...)` loop).
 
-### INV-7: `tests/` uses the public API by default, with one accepted direct-import exception
-- **Rule:** New tests should import from `query_classification` (the package `__init__.py`); importing `query_classification.resources` directly is an accepted exception (it's not re-exported by `__init__.py`, but the resource-path constants are needed for path-existence assertions). Do not import `categories.py`/`schema.py`/`classifier.py`/`pipeline.py`/`cli.py` directly.
-- **Why:** matches the existing test file exactly, including the one exception — keeps tests resilient to internal refactors of which module owns what, as long as the public API (+ `resources.py`) shape holds.
-- **Evidence:** `tests/test_building_blocks.py:7-16` (public API import + direct `query_classification.resources` import).
+### INV-7: `tests/` uses the public API by default, with accepted direct-import exceptions
+- **Rule:** New tests should import from `query_classification` (the package `__init__.py`). Accepted direct-import exceptions: `query_classification.resources` (resource-path constants needed for path-existence assertions); `query_classification.debate` (all functions — internal `--critics` orchestration, not part of the public API); and, specifically, `schema.build_critic_model`/`build_reconciler_model` and `prompts.build_critic_prompt`/`build_reconciler_prompt` (internal builder functions introduced alongside `debate.py`, not re-exported). The pre-existing `build_classification_model`/`build_system_prompt`/`schema_description` remain public-API-only. Do not import `categories.py`/`classifier.py`/`pipeline.py`/`cli.py` directly.
+- **Why:** matches the existing test file exactly, including the exceptions — keeps tests resilient to internal refactors of which module owns what, as long as the public API (+ the named exceptions) shape holds. The `debate.py`/schema/prompts exceptions give far more precise failure localization for a feature with this many interacting pieces than only testing through the public API indirectly.
+- **Evidence:** `tests/test_building_blocks.py:7-16` (public API import + direct `query_classification.resources` import); `tests/test_debate.py` (direct imports of `debate`, `build_critic_model`, `build_reconciler_model`, `build_critic_prompt`, `build_reconciler_prompt`).
+- *(amended by `spec/1-initial-classification-with-critics/ADR.md` ADR-002, 2026-09-08)*
 
 ### INV-8: Category names must be unique and must not equal the input `--column`
 - **Rule:** Category `name` values are used both as Pydantic model field names (via `create_model`) and as CSV output columns. Both collisions are now validated and rejected: `build_classification_model` raises `ValueError` listing any duplicate name(s) (`schema.py`, right before building `fields`); `classify_csv` raises `ValueError` if any category `name` equals `column` (`pipeline.py`, checked before the input CSV is even read).
@@ -159,7 +167,7 @@ unrelated interpreter.
 |---|---|---|
 | Dependency install | `./install.sh` (`--force` to rebuild from scratch) | Succeeds; installs `requirements.txt` (litellm, pandas, pydantic, python-dotenv, tqdm, pytest) into `.venv` |
 | Editable package install | `.venv/bin/python -m pip install -e .` | Succeeds; required separately for `-m query_classification` / library imports (see Known Gaps) |
-| Unit tests | `.venv/bin/python -m pytest` | Passing, no failures (`tests/test_building_blocks.py`) |
+| Unit tests | `.venv/bin/python -m pytest` | Passing, no failures (`tests/test_building_blocks.py`, `tests/test_debate.py`) |
 | CLI (script form) | `.venv/bin/python classify.py --help` | Works immediately after `install.sh`, no editable install needed |
 | CLI (module form) | `.venv/bin/python -m query_classification --help` | Works only after the editable install |
 | Wheel resource packaging | `.venv/bin/python -m pip wheel . -w /tmp/wheelcheck --no-deps` then inspect the archive | Confirms INV-3: **no** `resources/*.json`/`*.txt` present in the built wheel; `resources.check_default_resources_available()` now guards this in the CLI |

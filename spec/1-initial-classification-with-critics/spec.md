@@ -1,5 +1,9 @@
 # Spec 1: Multi-Agent Debate Classification with Critics
 
+> **Status: CLOSED** — Implemented and verified on 2026-09-08.
+> Implementation summary: `spec/1-initial-classification-with-critics/implementation-summary.md`
+> Merged from worktree branch `spec/1-initial-classification-with-critics` on 2026-09-08.
+
 ## Overview
 
 Adds an opt-in `--critics` mode to the classification CLI. Instead of one LLM call per
