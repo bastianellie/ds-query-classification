@@ -19,6 +19,10 @@ venv/
 output/
 *.bak
 
+# Experiment run directories (per-experiment scripts/READMEs are tracked;
+# their run output under runs/ is not)
+experiments/*/runs/
+
 # OS / editor
 .DS_Store
 .idea/

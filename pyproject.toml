@@ -24,6 +24,9 @@ dev = [
 hf = [
     "datasets>=4",
 ]
+cerebus = [
+    "boto3",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

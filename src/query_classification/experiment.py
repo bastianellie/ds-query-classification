@@ -23,6 +23,7 @@ import importlib.metadata
 import json
 import logging
 import math
+import os
 import platform
 import shutil
 import sys
@@ -36,7 +37,12 @@ from dotenv import load_dotenv
 
 from query_classification import debate
 from query_classification.categories import Category, Label, load_categories
-from query_classification.classifier import Classifier
+from query_classification.classifier import (
+    Classifier,
+    build_cerebus_completion_kwargs,
+    cerebus_model_id,
+    reject_insecure_cerebus_endpoint,
+)
 from query_classification.dataset_io import (
     load_hf_splits,
     load_local_split,
@@ -133,6 +139,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default="azure/gpt-5-chat",
         help="Base LiteLLM model id; every role below defaults to this",
+    )
+    common.add_argument(
+        "--cerebus",
+        action="store_true",
+        help="Route every LLM call (classification, critic/reconciler, induction) "
+        "through the Cerebus/Portkey gateway instead of a direct provider. "
+        "Configure via CEREBUS_MODE/CEREBUS_GATEWAY_*_URL/CEREBUS_CONFIG_ID/"
+        "CEREBUS_API_KEY in .env (see .env.example). --model and friends still "
+        "name the underlying model/slug; --api-base overrides the gateway URL "
+        "if explicitly given.",
     )
 
     induction = argparse.ArgumentParser(add_help=False)
@@ -401,11 +417,40 @@ def _missing(series: pd.Series) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_gateway_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve the gateway kwargs (api_base/api_key/extra_headers) once, so
+    every classifier role — across however many `_construct_classifiers`
+    calls one invocation makes (e.g. `run` calls it twice: once for
+    induction, once for classification) — shares the identical values rather
+    than each call independently re-reading the environment and re-resolving
+    the key. --api-base still wins if the user gave it explicitly, but must
+    be HTTPS under --cerebus (the gateway key/headers get attached to it
+    either way)."""
+    api_base = getattr(args, "api_base", None)
+    if not getattr(args, "cerebus", False):
+        return {"api_base": api_base, "api_key": None, "extra_headers": None}
+    if api_base:
+        reject_insecure_cerebus_endpoint(api_base)
+    resolved = build_cerebus_completion_kwargs()
+    return {
+        "api_base": api_base or resolved["api_base"],
+        "api_key": resolved["api_key"],
+        "extra_headers": resolved["extra_headers"],
+    }
+
+
 def _construct_classifiers(
-    args: argparse.Namespace, categories: list[Category] | None, will_induce: bool, will_classify: bool
+    args: argparse.Namespace,
+    categories: list[Category] | None,
+    will_induce: bool,
+    will_classify: bool,
+    gateway_kwargs: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str | None]]:
     """Construct every classifier role this invocation needs. Returns
-    (classifiers, resolved_model_ids)."""
+    (classifiers, resolved_model_ids). ``gateway_kwargs`` should be resolved
+    once per invocation via `_resolve_gateway_kwargs` and passed in by the
+    caller; if omitted (e.g. direct unit testing of this function), it's
+    resolved locally instead."""
     classifiers: dict[str, Any] = {}
     models: dict[str, str | None] = {
         "model": args.model,
@@ -414,14 +459,21 @@ def _construct_classifiers(
         "reconciler_model": None,
     }
 
+    use_cerebus = getattr(args, "cerebus", False)
+    if gateway_kwargs is None:
+        gateway_kwargs = _resolve_gateway_kwargs(args)
+
+    def _model_id(raw: str) -> str:
+        return cerebus_model_id(raw) if use_cerebus else raw
+
     if will_induce:
         models["induction_model"] = getattr(args, "induction_model", None) or args.model
         classifiers["induction"] = Classifier(
-            model_id=models["induction_model"],
+            model_id=_model_id(models["induction_model"]),
             system_prompt=build_induction_prompt(),
             classification_model=build_induction_model(),
             max_retries=getattr(args, "retries", 3),
-            api_base=getattr(args, "api_base", None),
+            **gateway_kwargs,
         )
 
     if will_classify:
@@ -439,12 +491,12 @@ def _construct_classifiers(
             allow_new_labels=allow_new_labels,
         )
         classifiers["classification"] = Classifier(
-            model_id=args.model,
+            model_id=_model_id(args.model),
             system_prompt=system_prompt,
             classification_model=classification_model,
             max_retries=args.retries,
-            api_base=args.api_base,
             temperature=args.sampling_temperature if args.critics else None,
+            **gateway_kwargs,
         )
 
         if args.critics:
@@ -455,18 +507,18 @@ def _construct_classifiers(
             for cat in categories:
                 label_options = "; ".join(f'"{lbl.value}": {lbl.description}' for lbl in cat.labels)
                 critic_classifiers[cat.name] = Classifier(
-                    model_id=models["critic_model"],
+                    model_id=_model_id(models["critic_model"]),
                     system_prompt=build_critic_prompt(cat.name, cat.description, label_options),
                     classification_model=build_critic_model(cat),
                     max_retries=args.retries,
-                    api_base=args.api_base,
+                    **gateway_kwargs,
                 )
                 reconciler_classifiers[cat.name] = Classifier(
-                    model_id=models["reconciler_model"],
+                    model_id=_model_id(models["reconciler_model"]),
                     system_prompt=build_reconciler_prompt(cat.name, cat.description, label_options),
                     classification_model=build_reconciler_model(cat),
                     max_retries=args.retries,
-                    api_base=args.api_base,
+                    **gateway_kwargs,
                 )
             classifiers["critics"] = critic_classifiers
             classifiers["reconcilers"] = reconciler_classifiers
@@ -555,6 +607,10 @@ def main() -> None:
         if uses_bundled_defaults:
             check_default_resources_available()
 
+        # Resolved once here, before any run-dir work, and reused by every
+        # _construct_classifiers call below — not re-resolved per role.
+        gateway_kwargs = _resolve_gateway_kwargs(args)
+
         run_dir = Path(args.run_dir)
 
         # Resolve and read/validate every supplied input path BEFORE any
@@ -620,6 +676,12 @@ def main() -> None:
             else None
         ),
         "versions": _versions_dict(),
+        # Enabled/mode only — never the gateway URL, config ID, or key,
+        # matching the existing rule that api_base's value is never recorded.
+        "cerebus": {
+            "enabled": getattr(args, "cerebus", False),
+            "mode": os.getenv("CEREBUS_MODE") if getattr(args, "cerebus", False) else None,
+        },
     }
 
     try:
@@ -675,7 +737,9 @@ def main() -> None:
         if will_induce:
             stage = "inducing"
             _log_phase("inducing")
-            classifiers, models = _construct_classifiers(args, None, will_induce=True, will_classify=False)
+            classifiers, models = _construct_classifiers(
+                args, None, will_induce=True, will_classify=False, gateway_kwargs=gateway_kwargs
+            )
             outcome = run_induction(
                 train_df,
                 args.text_column,
@@ -769,7 +833,7 @@ def main() -> None:
             test_df.to_csv(test_csv_path, index=False)
 
             classifiers, models = _construct_classifiers(
-                args, categories, will_induce=False, will_classify=True
+                args, categories, will_induce=False, will_classify=True, gateway_kwargs=gateway_kwargs
             )
             if will_induce:
                 models_final["critic_model"] = models.get("critic_model")

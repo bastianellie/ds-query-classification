@@ -42,6 +42,169 @@ def resolve_api_base() -> str | None:
     return None
 
 
+# --- Cerebus / Portkey gateway support -------------------------------------
+#
+# Cerebus is an internal LLM gateway (built on Portkey) some teams route
+# through instead of a direct provider. It has two addressing modes:
+#   - "azure":  an Azure-backed model, addressed by a Portkey Config ID
+#               (sent as the `x-portkey-config` header).
+#   - "direct": a directly-hosted model (OpenAI, Gemini, ...), addressed by
+#               an `@workspace/model` slug (sent as the `x-portkey-provider:
+#               openai` header, with the slug as litellm's `model` value).
+# Either way, litellm treats the call as a generic OpenAI-compatible endpoint
+# (the `openai/` model prefix), so the gateway/provider distinction lives
+# entirely in which URL + headers this module attaches, not in litellm's own
+# routing. This is opt-in (`--cerebus`, wired in cli.py/experiment.py) — a
+# run that doesn't ask for it never touches any of this.
+_CEREBUS_AWS_PROFILE_DEFAULT = "kd-nonprod"
+_CEREBUS_AWS_REGION_DEFAULT = "us-east-1"
+_CEREBUS_SECRET_ID_DEFAULT = "shared_genai/portkey-nonprod"
+_CEREBUS_SECRET_KEY_DEFAULT = "sciencedirect_portkey_api_key"
+
+_cerebus_api_key_cache: str | None = None
+
+
+def _cerebus_key_help_message(aws_profile: str, underlying: Exception | None = None) -> str:
+    msg = (
+        "No Cerebus API key is available: CEREBUS_API_KEY is not set, and it "
+        "could not be fetched from AWS Secrets Manager.\n"
+        f"  - To use an explicit key, set CEREBUS_API_KEY in .env.\n"
+        f"  - To use the AWS fallback, make sure you have an active SSO "
+        f"session: aws sso login --profile {aws_profile}\n"
+        "  - Also check CEREBUS_SECRET_ID/CEREBUS_SECRET_KEY/CEREBUS_AWS_REGION "
+        "if your secret isn't at the default coordinates."
+    )
+    if underlying is not None:
+        # Only the exception's type, never str(underlying): a botocore/SDK
+        # error's message text is not a trusted, sanitized value and must
+        # never be assumed safe to display or log verbatim (mirrors
+        # dataset_io.py's/induction.py's sanitized-failure convention).
+        msg += f"\n  (underlying error type: {type(underlying).__name__})"
+    return msg
+
+
+def _resolve_cerebus_api_key() -> str:
+    """Resolve the Cerebus/Portkey service key.
+
+    Resolution order: (1) the ``CEREBUS_API_KEY`` env var; (2) AWS Secrets
+    Manager, via ``CEREBUS_AWS_PROFILE``/``CEREBUS_AWS_REGION`` and the
+    JSON secret at ``CEREBUS_SECRET_ID``'s ``CEREBUS_SECRET_KEY`` field.
+    Only the AWS-fallback path is cached in-process (the env-var path is a
+    single ``os.getenv`` call, cheap enough not to need it) — never persisted
+    to disk. Raises ``RuntimeError`` with actionable remediation steps if
+    neither source yields a key.
+    """
+    global _cerebus_api_key_cache
+
+    env_key = os.getenv("CEREBUS_API_KEY")
+    if env_key:
+        return env_key
+    if _cerebus_api_key_cache:
+        return _cerebus_api_key_cache
+
+    aws_profile = os.getenv("CEREBUS_AWS_PROFILE", _CEREBUS_AWS_PROFILE_DEFAULT)
+    aws_region = os.getenv("CEREBUS_AWS_REGION", _CEREBUS_AWS_REGION_DEFAULT)
+    secret_id = os.getenv("CEREBUS_SECRET_ID", _CEREBUS_SECRET_ID_DEFAULT)
+    secret_key = os.getenv("CEREBUS_SECRET_KEY", _CEREBUS_SECRET_KEY_DEFAULT)
+
+    try:
+        import boto3  # optional dependency — see the `cerebus` extra
+    except ModuleNotFoundError as e:
+        if e.name != "boto3":
+            # A transitive dependency of boto3 is missing, not boto3 itself —
+            # misreporting this as "install boto3" would send someone in
+            # circles reinstalling a package that's already present.
+            raise
+        raise RuntimeError(
+            "AWS Secrets Manager fallback requires the optional 'boto3' "
+            "dependency, which is not installed. Install it with: "
+            "pip install '.[cerebus]' — or set CEREBUS_API_KEY directly."
+        ) from e
+
+    try:
+        import json as _json
+
+        session = boto3.Session(profile_name=aws_profile)
+        client = session.client("secretsmanager", region_name=aws_region)
+        response = client.get_secret_value(SecretId=secret_id)
+        key = _json.loads(response["SecretString"]).get(secret_key)
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"secret '{secret_id}' has no non-empty string key '{secret_key}'")
+    except Exception as e:  # noqa: BLE001 - any AWS/auth failure funnels into one clear error
+        raise RuntimeError(_cerebus_key_help_message(aws_profile, e)) from e
+
+    _cerebus_api_key_cache = key
+    return key
+
+
+def reject_insecure_cerebus_endpoint(api_base: str | None) -> None:
+    """Refuse a non-HTTPS endpoint override under ``--cerebus``.
+
+    The Cerebus API key and Portkey auth headers are attached to whatever
+    ``api_base`` is in effect (FR-1.4 lets an explicit ``--api-base`` win over
+    the resolved gateway URL) — sending them to a plain-HTTP or otherwise
+    malformed endpoint would expose the gateway credential in transit. This
+    is a minimal guard, not a full allowlist: it only rejects the clearly
+    unsafe case (no TLS), since the value is the user's own CLI flag, not
+    externally-attacker-controlled input.
+    """
+    if api_base is None:
+        return
+    if not api_base.lower().startswith("https://"):
+        raise ValueError(
+            f"--api-base must use https:// when --cerebus is set (got {api_base!r}) "
+            "— the gateway API key and auth headers would otherwise be sent in "
+            "the clear."
+        )
+
+
+def build_cerebus_completion_kwargs() -> dict[str, Any]:
+    """Resolve the Cerebus gateway configuration from the environment.
+
+    Returns ``{"api_base": ..., "api_key": ..., "extra_headers": {...}}``,
+    ready to merge into a ``Classifier`` constructor call. Raises
+    ``ValueError`` naming the missing/invalid setting if ``CEREBUS_MODE`` or
+    its required companion variables aren't configured — validated *before*
+    resolving the API key, so a configuration mistake surfaces without
+    waiting on (or masking behind) a slow/failing AWS call.
+    """
+    mode = os.getenv("CEREBUS_MODE")
+    if mode not in ("azure", "direct"):
+        raise ValueError(
+            f"CEREBUS_MODE must be 'azure' or 'direct', got {mode!r}. Set it in .env."
+        )
+
+    if mode == "azure":
+        api_base = os.getenv("CEREBUS_GATEWAY_AZURE_URL")
+        if not api_base:
+            raise ValueError("CEREBUS_GATEWAY_AZURE_URL is required when CEREBUS_MODE=azure")
+        config_id = os.getenv("CEREBUS_CONFIG_ID")
+        if not config_id:
+            raise ValueError("CEREBUS_CONFIG_ID is required when CEREBUS_MODE=azure")
+    else:
+        api_base = os.getenv("CEREBUS_GATEWAY_DIRECT_URL")
+        if not api_base:
+            raise ValueError("CEREBUS_GATEWAY_DIRECT_URL is required when CEREBUS_MODE=direct")
+        config_id = None
+
+    api_key = _resolve_cerebus_api_key()
+    headers = {"x-portkey-api-key": api_key}
+    if mode == "azure":
+        headers["x-portkey-config"] = config_id
+    else:
+        headers["x-portkey-provider"] = "openai"
+
+    return {"api_base": api_base, "api_key": api_key, "extra_headers": headers}
+
+
+def cerebus_model_id(model_id: str) -> str:
+    """Prefix ``model_id`` with litellm's ``openai/`` custom-provider marker,
+    if not already present — required for litellm to treat the Cerebus
+    gateway's ``api_base`` as a generic OpenAI-compatible endpoint rather than
+    trying to resolve ``model_id`` against a native provider."""
+    return model_id if model_id.startswith("openai/") else f"openai/{model_id}"
+
+
 class Classifier:
     """Classify a single text against a dynamically-built schema.
 
@@ -58,6 +221,8 @@ class Classifier:
         retry_delay: float = 5.0,
         api_base: str | None = None,
         temperature: float | None = None,
+        api_key: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         if max_retries < 1:
             raise ValueError(f"max_retries must be >= 1, got {max_retries}")
@@ -70,6 +235,13 @@ class Classifier:
         # Kept as None (never "") so litellm can fall back to its own resolution.
         self.api_base = api_base if api_base is not None else resolve_api_base()
         self.temperature = temperature
+        # Explicit api_key/extra_headers are for gateway setups (e.g. Cerebus/
+        # Portkey, see build_cerebus_completion_kwargs) that need a specific
+        # key and custom auth headers rather than litellm's own per-provider
+        # env-var resolution. Unset by default, so every existing call site
+        # keeps relying on litellm's native credential handling.
+        self.api_key = api_key
+        self.extra_headers = extra_headers
 
     def _completion_kwargs(self, messages: list[dict]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"model": self.model_id, "messages": messages}
@@ -81,6 +253,10 @@ class Classifier:
         # doesn't set it keeps relying on the provider's own default temperature.
         if self.temperature is not None:
             kwargs["temperature"] = self.temperature
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
         return kwargs
 
     def _complete(self, messages: list[dict]) -> str:

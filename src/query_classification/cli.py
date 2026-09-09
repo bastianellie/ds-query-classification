@@ -12,7 +12,12 @@ import litellm
 from dotenv import load_dotenv
 
 from query_classification.categories import load_categories
-from query_classification.classifier import Classifier
+from query_classification.classifier import (
+    Classifier,
+    build_cerebus_completion_kwargs,
+    cerebus_model_id,
+    reject_insecure_cerebus_endpoint,
+)
 from query_classification.pipeline import classify_csv
 from query_classification.prompts import (
     build_critic_prompt,
@@ -159,6 +164,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--model. May route the same row text to a different provider than "
         "--model.",
     )
+    parser.add_argument(
+        "--cerebus",
+        action="store_true",
+        help="Route every LLM call through the Cerebus/Portkey gateway instead "
+        "of a direct provider. Configure via CEREBUS_MODE/CEREBUS_GATEWAY_*_URL/"
+        "CEREBUS_CONFIG_ID/CEREBUS_API_KEY in .env (see .env.example). --model "
+        "and friends still name the underlying model/slug; --api-base overrides "
+        "the gateway URL if explicitly given.",
+    )
     return parser
 
 
@@ -227,13 +241,30 @@ def main() -> None:
                 "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
             )
 
+        # Cerebus is opt-in and resolved once: every Classifier below shares
+        # the same gateway credentials/headers. --api-base still wins if the
+        # user gave it explicitly (an override, not a gateway bypass) — but
+        # it must be HTTPS, since the gateway key/headers still get attached
+        # to it either way.
+        gateway_kwargs: dict = {"api_base": args.api_base, "api_key": None, "extra_headers": None}
+        if args.cerebus:
+            if args.api_base:
+                reject_insecure_cerebus_endpoint(args.api_base)
+            resolved = build_cerebus_completion_kwargs()
+            gateway_kwargs["api_base"] = args.api_base or resolved["api_base"]
+            gateway_kwargs["api_key"] = resolved["api_key"]
+            gateway_kwargs["extra_headers"] = resolved["extra_headers"]
+
+        def _model_id(raw: str) -> str:
+            return cerebus_model_id(raw) if args.cerebus else raw
+
         classifier = Classifier(
-            model_id=args.model,
+            model_id=_model_id(args.model),
             system_prompt=system_prompt,
             classification_model=classification_model,
             max_retries=args.retries,
-            api_base=args.api_base,
             temperature=args.sampling_temperature if args.critics else None,
+            **gateway_kwargs,
         )
 
         critic_classifiers = None
@@ -241,7 +272,7 @@ def main() -> None:
         if args.critics:
             critic_classifiers = {
                 cat.name: Classifier(
-                    model_id=args.critic_model or args.model,
+                    model_id=_model_id(args.critic_model or args.model),
                     system_prompt=build_critic_prompt(
                         cat.name,
                         cat.description,
@@ -249,13 +280,13 @@ def main() -> None:
                     ),
                     classification_model=build_critic_model(cat),
                     max_retries=args.retries,
-                    api_base=args.api_base,
+                    **gateway_kwargs,
                 )
                 for cat in categories
             }
             reconciler_classifiers = {
                 cat.name: Classifier(
-                    model_id=args.reconciler_model or args.model,
+                    model_id=_model_id(args.reconciler_model or args.model),
                     system_prompt=build_reconciler_prompt(
                         cat.name,
                         cat.description,
@@ -263,7 +294,7 @@ def main() -> None:
                     ),
                     classification_model=build_reconciler_model(cat),
                     max_retries=args.retries,
-                    api_base=args.api_base,
+                    **gateway_kwargs,
                 )
                 for cat in categories
             }
@@ -284,7 +315,7 @@ def main() -> None:
             consensus_threshold=args.consensus_threshold,
             allow_new_labels=allow_new_labels,
         )
-    except (ValueError, FileNotFoundError) as e:
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
         print(f"Error: {e}")
         sys.exit(1)
 

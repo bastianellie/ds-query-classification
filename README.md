@@ -108,6 +108,32 @@ python classify.py \
 | `--allow-new-labels` | Under `--critics`, allow suggesting `"none - <new label>"` instead of only predefined labels/`"none"`. |
 | `--critic-model` | LiteLLM model id for the `--critics` Critic role (default: `--model`). |
 | `--reconciler-model` | LiteLLM model id for the `--critics` Reconciler role (default: `--model`). |
+| `--cerebus` | Route every LLM call through the Cerebus/Portkey gateway instead of a direct provider (see below). |
+
+## Cerebus / Portkey gateway
+
+Both entry points (`classify.py` and `experiment.py`) accept `--cerebus` to route every
+LLM call through Cerebus — an internal gateway (built on [Portkey]) that fronts Azure
+OpenAI and direct-provider (OpenAI, Gemini, ...) models behind one OpenAI-compatible
+endpoint. `--model`/`--critic-model`/`--reconciler-model`/`--induction-model` still name
+the underlying model or workspace slug; `--cerebus` only changes how the call is
+authenticated and where it's sent.
+
+[Portkey]: https://portkey.ai/
+
+Configure it via `.env` (see `.env.example`):
+
+```bash
+CEREBUS_MODE=azure                  # or "direct" — see .env.example for the difference
+CEREBUS_GATEWAY_AZURE_URL=...       # required when CEREBUS_MODE=azure
+CEREBUS_GATEWAY_DIRECT_URL=...      # required when CEREBUS_MODE=direct
+CEREBUS_CONFIG_ID=...               # required when CEREBUS_MODE=azure
+```
+
+The API key resolves from `CEREBUS_API_KEY` if set, otherwise from AWS Secrets Manager
+(requires `pip install -e '.[cerebus]'` for the `boto3` dependency, and an active AWS SSO
+session) — a misconfiguration in either path fails with a clear, actionable error rather
+than a raw traceback. `--api-base` still overrides the gateway URL if given explicitly.
 
 ## Experiment runner
 
@@ -138,6 +164,8 @@ Equivalent to `python -m query_classification.experiment ...`. All of
 `classify`/`run` (`--model`, `--critics`, `--sampling-runs`, ...); `induce`/
 `run` additionally take `--seed`, `--examples-per-label`,
 `--max-example-chars`, `--max-prompt-chars`, and `--induction-model`.
+`--cerebus` is available on all three subcommands (it applies to the
+induction call too).
 
 For a HuggingFace dataset instead of local files, install the optional
 `hf` extra (`pip install '.[hf]'`, requires `datasets>=4`) and pass
