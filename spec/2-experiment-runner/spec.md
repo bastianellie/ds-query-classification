@@ -442,7 +442,7 @@ in the directory beforehand still exists afterwards.
 
 #### FR-3.5: Classifier configuration, and the closed-vocabulary divergence
 The classification phase exposes: `--model`, `--api-base`, `--retries`, `--workers`,
-`--limit`, the prompt-shaping inputs `--system-prompt`, `--task-description` and
+`--test-limit`, the prompt-shaping inputs `--system-prompt`, `--task-description` and
 `--extra-prompt` (these materially change predictions, so an experiment tool must be able
 to vary and record them), and Spec 1's `--critics`, `--sampling-runs`,
 `--sampling-temperature`, `--consensus-threshold`, `--allow-new-labels`, `--critic-model`,
@@ -458,17 +458,26 @@ Two behaviors differ from `classify.py` and are deliberate:
   *and* system prompt with it. Without this, plain-mode experiment output could contain
   invented labels that no gold label can ever match — silently corrupting the comparison
   the runner exists to enable.
-- **`--limit` truncates the materialized test split.** `classify_csv` creates prediction
-  columns for every row and classifies only `work_idx[:limit]` (`pipeline.py:171`),
-  leaving a blank tail. The runner therefore truncates `test.csv` to the limit **before**
-  classifying, so `test.csv` and `test_classified.csv` both contain exactly the evaluated
-  rows and an external scorer cannot mistake an unclassified tail for wrong predictions.
+- **`--test-limit` truncates the materialized test split; omitting it classifies the
+  whole thing.** `classify_csv` creates prediction columns for every row and classifies
+  only `work_idx[:limit]` (`pipeline.py:171`), leaving a blank tail. The runner therefore
+  truncates `test.csv` to the limit **before** classifying, so `test.csv` and
+  `test_classified.csv` both contain exactly the evaluated rows and an external scorer
+  cannot mistake an unclassified tail for wrong predictions. The flag has no default —
+  when it is not passed, no truncation happens and the entire test split is classified.
+  It is named `--test-limit`, not `--limit`, to make explicit that it bounds only the
+  test/classification split; it has no effect on the train split or induction sampling
+  (those are controlled independently by `--examples-per-label`/`--seed`), and the name
+  avoids collision with `classify.py`'s own unrelated `--limit` flag on a different entry
+  point.
 **Verify:** `run --critics --sampling-runs 3 --consensus-threshold 2` produces a classified
 CSV carrying Spec 1's audit columns, and the same run without `--critics` produces one with
 no audit columns; a plain-mode run with `--allow-new-labels` omitted builds its
 classification schema and system prompt with invention disabled (assert no `none - ` text
-in the rendered prompt); `--limit 5` over a 100-row test split produces a `test.csv` and
-`test_classified.csv` of exactly 5 rows with no null prediction rows.
+in the rendered prompt); `--test-limit 5` over a 100-row test split produces a `test.csv`
+and `test_classified.csv` of exactly 5 rows with no null prediction rows; omitting
+`--test-limit` over the same 100-row test split produces a `test.csv` and
+`test_classified.csv` of all 100 rows.
 
 #### FR-3.6: Generated columns must not collide with any source column
 The materialized `test.csv` (and therefore the classified output) retains the dataset's
@@ -508,7 +517,7 @@ five split cases, FR-1.7's dropped rows and count-once rule, FR-1.8's two withhe
 and unseen labels, FR-2.1's over-cap seed sensitivity, FR-2.3's preflight, FR-2.4's
 missing/invented label, FR-2.5's sentinel including a supplied file, FR-2.6's induction
 failure, FR-2.7's degenerate splits, FR-3.2's multi-category rejection, FR-3.4's overwrite
-preservation, FR-3.5's plain-mode closed vocabulary and `--limit` truncation, FR-3.6's
+preservation, FR-3.5's plain-mode closed vocabulary and `--test-limit` truncation, FR-3.6's
 three collision cases, FR-3.8's partial-failure status).
 **Verify:** `pytest` passes and includes test functions exercising every FR's Verify
 condition above without making a real LLM or Hub call.
@@ -578,7 +587,8 @@ for the setup `cli.py` performs today, applying the same rules:
   `1 <= consensus_threshold <= sampling_runs`, finite non-negative `sampling_temperature`,
   `max_retries >= 1`) with this spec's: `--examples-per-label >= 1`,
   `--max-example-chars >= 1`, `--max-prompt-chars >= 1`, `--seed` a non-negative integer,
-  `--limit >= 0`. All validation runs **before** any directory write, Hub load, or LLM call.
+  `--test-limit >= 0`. All validation runs **before** any directory write, Hub load, or LLM
+  call.
 
 ---
 
@@ -591,7 +601,7 @@ for the setup `cli.py` performs today, applying the same rules:
 | `run_config.json` | all subcommands (**last**) | Reproducibility/audit record (below), including terminal `status` |
 | `categories.json` | all subcommands | Induced categories; or a verbatim copy of `--categories` |
 | `train.csv` | `induce`, `run` (when inducing) | Materialized train split actually sampled from, needed columns only, post-FR-1.7 filtering |
-| `test.csv` | `classify`, `run` | Materialized test split actually classified, needed columns only, post-FR-1.7 filtering and post-`--limit` truncation, gold column renamed per FR-3.6 |
+| `test.csv` | `classify`, `run` | Materialized test split actually classified, needed columns only, post-FR-1.7 filtering and post-`--test-limit` truncation (whole split when omitted), gold column renamed per FR-3.6 |
 | `test_classified.csv` | `classify`, `run` | `test.csv` plus prediction columns (and Spec 1 audit columns under `--critics`) |
 | `induction_prompt.txt` | `induce`, `run` (when inducing) | The **rendered** system prompt + user message actually sent, for replay (FR-3.4) |
 | `sampled_examples.json` | `induce`, `run` (when inducing) | Per-label manifest of the sampled source row positions and their (truncated) texts |
@@ -607,7 +617,7 @@ for the setup `cli.py` performs today, applying the same rules:
 | `text_column`, `label_column`, `category_name` | Column/category selection |
 | `seed`, `examples_per_label`, `max_example_chars`, `max_prompt_chars` | Induction sampling/bounding parameters (FR-2.1, FR-2.3) |
 | `models` | `{model, induction_model, critic_model, reconciler_model}` as resolved (after defaulting to `--model`) |
-| `classifier_config` | `{critics, sampling_runs, sampling_temperature, consensus_threshold, allow_new_labels, retries, workers, limit}` |
+| `classifier_config` | `{critics, sampling_runs, sampling_temperature, consensus_threshold, allow_new_labels, retries, workers, test_limit}` |
 | `prompt_inputs` | `{system_prompt, task_description, extra_prompt}` — the paths given, or null |
 | `label_values` | The distinct gold label values found, **sorted** — pinned to sorted rather than discovery order so two identical runs produce byte-identical configs; the same sorted order groups labels in the induction prompt |
 | `test_labels` | `"present"` \| `"withheld"` (FR-1.8) |
@@ -685,8 +695,9 @@ tokens, or the `api_base` value (see Constraints).
 - **`--critics` cost multiplier is inherited.** Per-row LLM volume is roughly
   `sampling_runs + contested_categories + challenged_categories` logical calls (Spec 1's
   Constraints) on top of `workers` rows in flight, so instantaneous concurrency approaches
-  `workers × sampling_runs` — significant on a full benchmark. `--limit` is exposed
-  (FR-3.5) for a cheap canary run first.
+  `workers × sampling_runs` — significant on a full benchmark. `--test-limit` is exposed
+  (FR-3.5) for a cheap canary run first; the flag has no default, so a full run needs no
+  special invocation, only the omission of `--test-limit`.
 - **Non-atomic CSV writes are inherited, not fixed.** `classify_csv`'s incremental writes
   are not atomic (a documented Known Gap); a crash mid-write can truncate
   `test_classified.csv`. Run directories are always fresh (FR-3.4), so unlike an in-place
@@ -737,7 +748,7 @@ tokens, or the `api_base` value (see Constraints).
 
 - [x] **Scope & acceptance criteria** — FR-1.1 through FR-3.8 each carry a testable
   **Verify:** line, including the previously-undefined cases surfaced in critique
-  (withheld/`-1` labels, `--limit` truncation, partial classification, overwrite semantics,
+  (withheld/`-1` labels, `--test-limit` truncation, partial classification, overwrite semantics,
   classify-only artifact copying, degenerate splits). Out of Scope names thirteen
   considered-and-rejected directions, including the three deferred with explicit reasons
   (global concurrency cap, CSV sanitization, `api_base` fingerprinting).
@@ -787,7 +798,7 @@ tokens, or the `api_base` value (see Constraints).
   all three axes (FR-2.1 count, FR-2.3 per-example chars **and** a total-size preflight);
   classification cost is `classify_csv`'s existing profile with Spec 1's `--critics`
   multiplier and the `workers × sampling_runs` instantaneous-concurrency figure stated in
-  Constraints, and `--limit` exposed for canary runs; AR-1.3's column projection before
+  Constraints, and `--test-limit` exposed for canary runs; AR-1.3's column projection before
   `to_pandas()` cuts the Arrow→pandas→CSV→pandas amplification. Whole-split materialization
   remains bounded by the no-streaming line in Out of Scope rather than by a mechanism, and
   a global concurrency cap is explicitly deferred there.
@@ -805,3 +816,30 @@ tokens, or the `api_base` value (see Constraints).
   parsing lossiness (FR-1.3), incomplete classification (FR-3.8), and sensitive-column
   replication (AR-1.3). The headline risk is stated plainly: induction quality is the
   empirical question the runner exists to answer, and cannot be asserted as a requirement.
+
+---
+
+## Change Log
+
+### Update from manual update (2026-09-09)
+
+**Applied:**
+- Renamed the classification-phase flag `--limit` to `--test-limit` (FR-3.5, AR-3.4),
+  and the corresponding `run_config.json` field `classifier_config.limit` to
+  `classifier_config.test_limit` — verified already implemented in
+  `src/query_classification/experiment.py`, `tests/test_experiment.py`, and `README.md`.
+  The rename is cosmetic only: the flag never had a default, and omitting it already
+  classified the entire test split before and after this change. FR-3.5 and the Data
+  Requirements table now state the no-default behavior explicitly (it was previously
+  true but not called out), and explain the rename's motivation — disambiguating from
+  `classify.py`'s own separate, pre-existing `--limit` flag on a different entry point,
+  and making clear the flag bounds only the test/classification split, not induction
+  sampling (which FR-2.1 controls independently via `--examples-per-label`/`--seed`).
+- Updated every other `--limit` reference in this spec (FR-3.7, AR-3.4, Data
+  Requirements, Constraints, Spec Completeness Checklist) to `--test-limit` for
+  consistency.
+
+**Rejected:** None — this update is a straightforward rename with no open design
+questions.
+
+**Reorganized:** None.

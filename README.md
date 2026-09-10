@@ -112,28 +112,43 @@ python classify.py \
 
 ## Cerebus / Portkey gateway
 
-Both entry points (`classify.py` and `experiment.py`) accept `--cerebus` to route every
-LLM call through Cerebus — an internal gateway (built on [Portkey]) that fronts Azure
-OpenAI and direct-provider (OpenAI, Gemini, ...) models behind one OpenAI-compatible
-endpoint. `--model`/`--critic-model`/`--reconciler-model`/`--induction-model` still name
-the underlying model or workspace slug; `--cerebus` only changes how the call is
-authenticated and where it's sent.
+Both entry points (`classify.py` and `experiment.py`) can route every LLM call through
+Cerebus — an internal gateway (built on [Portkey]) that fronts Azure OpenAI and
+direct-provider (OpenAI, Gemini, ...) models behind one OpenAI-compatible endpoint —
+instead of a direct provider. `--model`/`--critic-model`/`--reconciler-model`/
+`--induction-model` still name the underlying model or workspace slug; Cerebus only
+changes how the call is authenticated and where it's sent.
 
 [Portkey]: https://portkey.ai/
 
-Configure it via `.env` (see `.env.example`):
+**Minimal setup** (matches the convention used elsewhere internally) — in `.env`:
 
 ```bash
-CEREBUS_MODE=azure                  # or "direct" — see .env.example for the difference
-CEREBUS_GATEWAY_AZURE_URL=...       # required when CEREBUS_MODE=azure
-CEREBUS_GATEWAY_DIRECT_URL=...      # required when CEREBUS_MODE=direct
-CEREBUS_CONFIG_ID=...               # required when CEREBUS_MODE=azure
+DEFAULT_LLM_PROVIDER=cerebus
+CEREBUS_API_KEY=...   # optional — falls back to AWS Secrets Manager if unset
 ```
+
+Nothing else is required: the gateway mode defaults to `"direct"` (no per-model
+configuration needed) and the gateway URL defaults to this org's shared nonprod Cerebus
+endpoint. `--cerebus` on either entry point is an equivalent, per-invocation alternative
+to setting `DEFAULT_LLM_PROVIDER` — either one turns gateway routing on.
 
 The API key resolves from `CEREBUS_API_KEY` if set, otherwise from AWS Secrets Manager
 (requires `pip install -e '.[cerebus]'` for the `boto3` dependency, and an active AWS SSO
-session) — a misconfiguration in either path fails with a clear, actionable error rather
-than a raw traceback. `--api-base` still overrides the gateway URL if given explicitly.
+session: `aws sso login --profile kd-nonprod`) — a misconfiguration in either path fails
+with a clear, actionable error rather than a raw traceback.
+
+**Advanced overrides** (see `.env.example`), only needed to deviate from the defaults:
+
+```bash
+CEREBUS_MODE=azure                  # opt into Azure-config-mode routing (default: "direct")
+CEREBUS_GATEWAY_AZURE_URL=...       # override the default Azure gateway URL
+CEREBUS_GATEWAY_DIRECT_URL=...      # override the default direct gateway URL
+CEREBUS_CONFIG_ID=...               # required when CEREBUS_MODE=azure (no default — workspace/model-specific)
+```
+
+`--api-base` still overrides the resolved gateway URL if given explicitly (must be
+`https://` when Cerebus is active).
 
 ## Experiment runner
 
@@ -165,7 +180,10 @@ Equivalent to `python -m query_classification.experiment ...`. All of
 `run` additionally take `--seed`, `--examples-per-label`,
 `--max-example-chars`, `--max-prompt-chars`, and `--induction-model`.
 `--cerebus` is available on all three subcommands (it applies to the
-induction call too).
+induction call too). One exception: `classify.py`'s `--limit` is called
+`--test-limit` here, to make clear it only bounds the test split being
+classified (not the train split used for induction); omitting it classifies
+the entire test split.
 
 For a HuggingFace dataset instead of local files, install the optional
 `hf` extra (`pip install '.[hf]'`, requires `datasets>=4`) and pass

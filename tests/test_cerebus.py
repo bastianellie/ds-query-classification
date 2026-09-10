@@ -11,10 +11,11 @@ import types
 
 import pytest
 
+from query_classification import Classifier
 from query_classification import classifier as classifier_module
 from query_classification.classifier import (
-    Classifier,
     build_cerebus_completion_kwargs,
+    cerebus_enabled_via_env,
     cerebus_model_id,
 )
 
@@ -192,25 +193,43 @@ def test_resolve_key_missing_json_key_raises(monkeypatch, fake_boto3):
 # ---------------------------------------------------------------------------
 
 
-def test_build_kwargs_requires_valid_mode(monkeypatch):
+def test_build_kwargs_mode_defaults_to_direct(monkeypatch):
+    """CEREBUS_MODE is optional: unset means 'direct', not an error, so the
+    minimal-footprint setup (DEFAULT_LLM_PROVIDER=cerebus + optional
+    CEREBUS_API_KEY, nothing else) works out of the box."""
+    monkeypatch.setenv("CEREBUS_API_KEY", "k")
     monkeypatch.delenv("CEREBUS_MODE", raising=False)
-    with pytest.raises(ValueError, match="CEREBUS_MODE"):
-        build_cerebus_completion_kwargs()
+    monkeypatch.delenv("CEREBUS_GATEWAY_DIRECT_URL", raising=False)
+    result = build_cerebus_completion_kwargs()
+    assert result["extra_headers"]["x-portkey-provider"] == "openai"
 
+
+def test_build_kwargs_rejects_invalid_mode(monkeypatch):
     monkeypatch.setenv("CEREBUS_MODE", "not-a-real-mode")
     with pytest.raises(ValueError, match="CEREBUS_MODE"):
         build_cerebus_completion_kwargs()
 
 
-def test_build_kwargs_azure_mode_requires_gateway_url_and_config_id(monkeypatch):
+def test_build_kwargs_gateway_urls_default_when_unset(monkeypatch):
+    """Both gateway URLs fall back to this org's shared nonprod endpoints
+    when not overridden — no CEREBUS_GATEWAY_*_URL needed for the common case."""
+    monkeypatch.setenv("CEREBUS_API_KEY", "k")
+    monkeypatch.delenv("CEREBUS_GATEWAY_DIRECT_URL", raising=False)
+    monkeypatch.setenv("CEREBUS_MODE", "direct")
+    result = build_cerebus_completion_kwargs()
+    assert result["api_base"] == "https://gw.nonprod.cerebus.tio.elsevier.systems/v1"
+
+    monkeypatch.delenv("CEREBUS_GATEWAY_AZURE_URL", raising=False)
+    monkeypatch.setenv("CEREBUS_MODE", "azure")
+    monkeypatch.setenv("CEREBUS_CONFIG_ID", "pc-abc123")
+    result = build_cerebus_completion_kwargs()
+    assert result["api_base"] == "https://gw.az.nonprod.cerebus.tio.elsevier.systems/v1"
+
+
+def test_build_kwargs_azure_mode_requires_config_id(monkeypatch):
     monkeypatch.setenv("CEREBUS_API_KEY", "k")
     monkeypatch.setenv("CEREBUS_MODE", "azure")
-    monkeypatch.delenv("CEREBUS_GATEWAY_AZURE_URL", raising=False)
     monkeypatch.delenv("CEREBUS_CONFIG_ID", raising=False)
-    with pytest.raises(ValueError, match="CEREBUS_GATEWAY_AZURE_URL"):
-        build_cerebus_completion_kwargs()
-
-    monkeypatch.setenv("CEREBUS_GATEWAY_AZURE_URL", "https://gw.example/v1")
     with pytest.raises(ValueError, match="CEREBUS_CONFIG_ID"):
         build_cerebus_completion_kwargs()
 
@@ -224,14 +243,6 @@ def test_build_kwargs_azure_mode_success(monkeypatch):
     assert result["api_base"] == "https://gw.example/v1"
     assert result["api_key"] == "k"
     assert result["extra_headers"] == {"x-portkey-api-key": "k", "x-portkey-config": "pc-abc123"}
-
-
-def test_build_kwargs_direct_mode_requires_gateway_url(monkeypatch):
-    monkeypatch.setenv("CEREBUS_API_KEY", "k")
-    monkeypatch.setenv("CEREBUS_MODE", "direct")
-    monkeypatch.delenv("CEREBUS_GATEWAY_DIRECT_URL", raising=False)
-    with pytest.raises(ValueError, match="CEREBUS_GATEWAY_DIRECT_URL"):
-        build_cerebus_completion_kwargs()
 
 
 def test_build_kwargs_direct_mode_success(monkeypatch):
@@ -259,6 +270,18 @@ def test_build_kwargs_direct_mode_success(monkeypatch):
 )
 def test_cerebus_model_id(raw, expected):
     assert cerebus_model_id(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("cerebus", True), ("Cerebus", True), (" CEREBUS ", True), ("azure", False), ("", False), (None, False)],
+)
+def test_cerebus_enabled_via_env(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("DEFAULT_LLM_PROVIDER", raising=False)
+    else:
+        monkeypatch.setenv("DEFAULT_LLM_PROVIDER", value)
+    assert cerebus_enabled_via_env() is expected
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +312,89 @@ def test_classifier_completion_kwargs_include_gateway_fields_when_set():
     kwargs = clf._completion_kwargs([])
     assert kwargs["api_key"] == "k"
     assert kwargs["extra_headers"] == {"x-portkey-api-key": "k"}
+
+
+# ---------------------------------------------------------------------------
+# Classifier: temperature dropped and retried once on UnsupportedParamsError
+# (reasoning models that reject an explicit temperature entirely)
+# ---------------------------------------------------------------------------
+
+
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content):
+        self.message = _FakeMessage(content)
+
+
+class _FakeResponse:
+    def __init__(self, content):
+        self.choices = [_FakeChoice(content)]
+
+
+def _valid_content():
+    import json
+
+    return json.dumps({"c": ["x"]})
+
+
+def test_complete_drops_temperature_once_on_unsupported_params_error(monkeypatch):
+    import litellm
+
+    calls = []
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        if "temperature" in kwargs:
+            raise litellm.UnsupportedParamsError(
+                message="doesn't support temperature=0.7 while reasoning is active",
+                model=kwargs.get("model", ""),
+                llm_provider="openai",
+            )
+        return _FakeResponse(_valid_content())
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    clf = _classifier(temperature=0.7)
+    content = clf._complete([{"role": "user", "content": "hi"}])
+    assert content == _valid_content()
+    assert len(calls) == 2  # one failed attempt (with temperature), one retry (without)
+    assert "temperature" in calls[0]
+    assert "temperature" not in calls[1]
+
+
+def test_complete_reraises_unsupported_params_error_when_no_temperature_to_drop(monkeypatch):
+    """If the model rejects some OTHER param we don't control, there's nothing
+    to drop and retry — this must not loop or swallow the real error."""
+    import litellm
+
+    def fake_completion(**kwargs):
+        raise litellm.UnsupportedParamsError(
+            message="doesn't support tool_choice", model="", llm_provider="openai"
+        )
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    clf = _classifier()  # no temperature set at all
+    with pytest.raises(litellm.UnsupportedParamsError):
+        clf._complete([{"role": "user", "content": "hi"}])
+
+
+def test_complete_does_not_retry_temperature_drop_twice(monkeypatch):
+    """A second UnsupportedParamsError after the temperature is already
+    dropped must propagate, not recurse forever."""
+    import litellm
+
+    def fake_completion(**kwargs):
+        raise litellm.UnsupportedParamsError(
+            message="still unsupported for another reason", model="", llm_provider="openai"
+        )
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    clf = _classifier(temperature=0.7)
+    with pytest.raises(litellm.UnsupportedParamsError):
+        clf._complete([{"role": "user", "content": "hi"}])
 
 
 # ---------------------------------------------------------------------------
@@ -323,11 +429,15 @@ def test_experiment_parser_has_cerebus_flag_on_all_subcommands():
         assert ns.cerebus is True
 
 
-def test_cli_main_reports_clean_error_on_missing_cerebus_mode(tmp_path, monkeypatch, capsys):
+def test_cli_main_reports_clean_error_on_invalid_cerebus_mode(tmp_path, monkeypatch, capsys):
     import sys as _sys
     from query_classification.cli import main as cli_main
 
-    monkeypatch.delenv("CEREBUS_MODE", raising=False)
+    # CEREBUS_MODE is optional (defaults to "direct") — only an explicitly
+    # *invalid* value is an error now. no-op load_dotenv so the real .env
+    # can't clobber this test's own env (see _set_direct_mode_env's comment).
+    monkeypatch.setattr("query_classification.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("CEREBUS_MODE", "not-a-real-mode")
     (tmp_path / "in.csv").write_text("text\nhello\n")
     _sys.argv = [
         "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
@@ -339,11 +449,12 @@ def test_cli_main_reports_clean_error_on_missing_cerebus_mode(tmp_path, monkeypa
     assert "CEREBUS_MODE" in capsys.readouterr().out
 
 
-def test_experiment_main_reports_clean_error_on_missing_cerebus_mode(tmp_path, monkeypatch, capsys):
+def test_experiment_main_reports_clean_error_on_invalid_cerebus_mode(tmp_path, monkeypatch, capsys):
     import sys as _sys
     from query_classification.experiment import main as experiment_main
 
-    monkeypatch.delenv("CEREBUS_MODE", raising=False)
+    monkeypatch.setattr("query_classification.experiment.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("CEREBUS_MODE", "not-a-real-mode")
     (tmp_path / "test.csv").write_text("text,label\nhello,positive\n")
     cats_path = tmp_path / "cats.json"
     cats_path.write_text(
@@ -403,6 +514,72 @@ def _set_direct_mode_env(monkeypatch):
     monkeypatch.setenv("CEREBUS_MODE", "direct")
     monkeypatch.setenv("CEREBUS_GATEWAY_DIRECT_URL", "https://gw.example/v1")
     monkeypatch.setenv("CEREBUS_API_KEY", "test-key")
+
+
+def _set_minimal_footprint_env(monkeypatch):
+    """Exactly the two env vars a real minimal setup uses: DEFAULT_LLM_PROVIDER
+    and CEREBUS_API_KEY. No --cerebus flag, no CEREBUS_MODE, no gateway URL —
+    everything else must come from the built-in defaults."""
+    monkeypatch.setattr("query_classification.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("query_classification.experiment.load_dotenv", lambda *a, **k: None)
+    for var in ("CEREBUS_MODE", "CEREBUS_GATEWAY_AZURE_URL", "CEREBUS_GATEWAY_DIRECT_URL", "CEREBUS_CONFIG_ID"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DEFAULT_LLM_PROVIDER", "cerebus")
+    monkeypatch.setenv("CEREBUS_API_KEY", "test-key")
+
+
+def test_cli_minimal_footprint_env_only(tmp_path, monkeypatch, recorded_classifier_inits):
+    """The exact setup the user asked to replicate: DEFAULT_LLM_PROVIDER=cerebus
+    + CEREBUS_API_KEY, nothing else, no --cerebus flag — must route through
+    Cerebus using the built-in direct-mode gateway default."""
+    import sys as _sys
+    from query_classification.cli import main as cli_main
+
+    _set_minimal_footprint_env(monkeypatch)
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    cats_path = tmp_path / "cats.json"
+    cats_path.write_text(
+        '{"categories": [{"name": "c", "description": "d", '
+        '"labels": [{"value": "x", "description": "d"}]}]}'
+    )
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--output", str(tmp_path / "out.csv"), "--categories", str(cats_path),
+    ]
+    cli_main()
+
+    calls = recorded_classifier_inits
+    assert len(calls) == 1
+    assert calls[0]["model_id"].startswith("openai/")
+    assert calls[0]["extra_headers"] == {
+        "x-portkey-api-key": "test-key",
+        "x-portkey-provider": "openai",
+    }
+
+
+def test_experiment_minimal_footprint_env_only(tmp_path, monkeypatch, recorded_classifier_inits):
+    import sys as _sys
+    from query_classification.experiment import main as experiment_main
+
+    _set_minimal_footprint_env(monkeypatch)
+    test = tmp_path / "test.csv"
+    test.write_text("text,label\nhello,positive\n")
+    cats_path = tmp_path / "cats.json"
+    cats_path.write_text(
+        '{"categories": [{"name": "c", "description": "d", '
+        '"labels": [{"value": "positive", "description": "d"}]}]}'
+    )
+    run_dir = tmp_path / "r"
+    _sys.argv = [
+        "experiment.py", "classify", "--test-file", str(test), "--text-column", "text",
+        "--label-column", "label", "--categories", str(cats_path), "--run-dir", str(run_dir),
+    ]
+    experiment_main()
+
+    calls = recorded_classifier_inits
+    assert len(calls) == 1
+    assert calls[0]["model_id"].startswith("openai/")
+    assert calls[0]["extra_headers"]["x-portkey-provider"] == "openai"
 
 
 def test_cli_critics_run_prefixes_and_shares_headers_across_every_role(

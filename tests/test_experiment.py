@@ -853,7 +853,7 @@ def test_limit_truncates_before_classifying(tmp_path, fake_classify):
     run_dir = tmp_path / "r"
     code = _run_main(
         ["classify", "--test-file", str(test), "--text-column", "text", "--label-column", "label",
-         "--categories", str(cats_path), "--run-dir", str(run_dir), "--limit", "3"]
+         "--categories", str(cats_path), "--run-dir", str(run_dir), "--test-limit", "3"]
     )
     assert code in (0, None)
     df = pd.read_csv(run_dir / "test_classified.csv")

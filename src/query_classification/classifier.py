@@ -46,22 +46,41 @@ def resolve_api_base() -> str | None:
 #
 # Cerebus is an internal LLM gateway (built on Portkey) some teams route
 # through instead of a direct provider. It has two addressing modes:
+#   - "direct" (the default): a directly-hosted model (OpenAI, Gemini, ...),
+#               addressed by an `@workspace/model` slug — or a bare model
+#               name — passed through as-is via `--model`/`--critic-model`/
+#               etc., sent with an `x-portkey-provider: openai` header. No
+#               extra per-model configuration is needed for this mode.
 #   - "azure":  an Azure-backed model, addressed by a Portkey Config ID
-#               (sent as the `x-portkey-config` header).
-#   - "direct": a directly-hosted model (OpenAI, Gemini, ...), addressed by
-#               an `@workspace/model` slug (sent as the `x-portkey-provider:
-#               openai` header, with the slug as litellm's `model` value).
+#               (sent as the `x-portkey-config` header) — opt-in via
+#               `CEREBUS_MODE=azure`, since a Config ID is workspace- and
+#               model-specific and has no sensible default.
 # Either way, litellm treats the call as a generic OpenAI-compatible endpoint
 # (the `openai/` model prefix), so the gateway/provider distinction lives
 # entirely in which URL + headers this module attaches, not in litellm's own
-# routing. This is opt-in (`--cerebus`, wired in cli.py/experiment.py) — a
-# run that doesn't ask for it never touches any of this.
+# routing. Enabled via `--cerebus` or `DEFAULT_LLM_PROVIDER=cerebus` (wired in
+# cli.py/experiment.py) — a run that asks for neither never touches any of
+# this. The gateway URLs below default to this org's shared nonprod Cerebus
+# endpoints (same values used by other internal tools) so that, combined with
+# the "direct" mode default, most setups need only `DEFAULT_LLM_PROVIDER=cerebus`
+# plus an optional `CEREBUS_API_KEY` — matching the minimal-footprint
+# convention used elsewhere internally. Every default below is still
+# independently overridable via its own env var.
+_CEREBUS_GATEWAY_AZURE_URL_DEFAULT = "https://gw.az.nonprod.cerebus.tio.elsevier.systems/v1"
+_CEREBUS_GATEWAY_DIRECT_URL_DEFAULT = "https://gw.nonprod.cerebus.tio.elsevier.systems/v1"
 _CEREBUS_AWS_PROFILE_DEFAULT = "kd-nonprod"
 _CEREBUS_AWS_REGION_DEFAULT = "us-east-1"
 _CEREBUS_SECRET_ID_DEFAULT = "shared_genai/portkey-nonprod"
 _CEREBUS_SECRET_KEY_DEFAULT = "sciencedirect_portkey_api_key"
 
 _cerebus_api_key_cache: str | None = None
+
+
+def cerebus_enabled_via_env() -> bool:
+    """True if `DEFAULT_LLM_PROVIDER=cerebus` (case-insensitive) — an
+    alternative to passing `--cerebus` explicitly, for a "set it in .env and
+    forget it" setup. Either one turns Cerebus routing on."""
+    return os.getenv("DEFAULT_LLM_PROVIDER", "").strip().lower() == "cerebus"
 
 
 def _cerebus_key_help_message(aws_profile: str, underlying: Exception | None = None) -> str:
@@ -162,29 +181,30 @@ def build_cerebus_completion_kwargs() -> dict[str, Any]:
     """Resolve the Cerebus gateway configuration from the environment.
 
     Returns ``{"api_base": ..., "api_key": ..., "extra_headers": {...}}``,
-    ready to merge into a ``Classifier`` constructor call. Raises
-    ``ValueError`` naming the missing/invalid setting if ``CEREBUS_MODE`` or
-    its required companion variables aren't configured — validated *before*
-    resolving the API key, so a configuration mistake surfaces without
-    waiting on (or masking behind) a slow/failing AWS call.
+    ready to merge into a ``Classifier`` constructor call. ``CEREBUS_MODE``
+    defaults to ``"direct"`` (no per-model configuration needed) and the
+    gateway URLs default to this org's shared nonprod endpoints — so the
+    common case needs no ``CEREBUS_*`` variables beyond an optional
+    ``CEREBUS_API_KEY``. Raises ``ValueError`` naming the invalid setting if
+    ``CEREBUS_MODE`` is set to something other than ``"azure"``/``"direct"``,
+    or if `azure` mode's required ``CEREBUS_CONFIG_ID`` (which has no
+    sensible default — it's workspace- and model-specific) is missing —
+    validated *before* resolving the API key, so a configuration mistake
+    surfaces without waiting on (or masking behind) a slow/failing AWS call.
     """
-    mode = os.getenv("CEREBUS_MODE")
+    mode = os.getenv("CEREBUS_MODE", "direct")
     if mode not in ("azure", "direct"):
         raise ValueError(
             f"CEREBUS_MODE must be 'azure' or 'direct', got {mode!r}. Set it in .env."
         )
 
     if mode == "azure":
-        api_base = os.getenv("CEREBUS_GATEWAY_AZURE_URL")
-        if not api_base:
-            raise ValueError("CEREBUS_GATEWAY_AZURE_URL is required when CEREBUS_MODE=azure")
+        api_base = os.getenv("CEREBUS_GATEWAY_AZURE_URL", _CEREBUS_GATEWAY_AZURE_URL_DEFAULT)
         config_id = os.getenv("CEREBUS_CONFIG_ID")
         if not config_id:
             raise ValueError("CEREBUS_CONFIG_ID is required when CEREBUS_MODE=azure")
     else:
-        api_base = os.getenv("CEREBUS_GATEWAY_DIRECT_URL")
-        if not api_base:
-            raise ValueError("CEREBUS_GATEWAY_DIRECT_URL is required when CEREBUS_MODE=direct")
+        api_base = os.getenv("CEREBUS_GATEWAY_DIRECT_URL", _CEREBUS_GATEWAY_DIRECT_URL_DEFAULT)
         config_id = None
 
     api_key = _resolve_cerebus_api_key()
@@ -261,10 +281,33 @@ class Classifier:
 
     def _complete(self, messages: list[dict]) -> str:
         kwargs = self._completion_kwargs(messages)
+        return self._attempt_completion(kwargs, allow_temperature_drop=True)
+
+    def _attempt_completion(
+        self, kwargs: dict[str, Any], *, allow_temperature_drop: bool
+    ) -> str:
         try:
             # Preferred: structured output with json_schema (not all models support this).
             response = litellm.completion(
                 response_format=self.classification_model, **kwargs
+            )
+        except litellm.UnsupportedParamsError:
+            # litellm.UnsupportedParamsError is a subclass of BadRequestError, so
+            # this must be checked before that broader except below - otherwise
+            # it would be misdiagnosed as "structured output unsupported" and
+            # retried in json_object mode with the same (still-unsupported)
+            # temperature, failing again for the same reason instead of fixing it.
+            # Some newer/reasoning models reject an explicit temperature outright
+            # while reasoning is active - only their fixed default (usually 1) is
+            # accepted. Retry once with it dropped, rather than burning every
+            # outer retry attempt (classify()'s own loop) on a failure retrying
+            # alone can never fix. Only the --critics sampling role ever sets
+            # self.temperature, so this is a no-op for every other role.
+            if not allow_temperature_drop or "temperature" not in kwargs:
+                raise
+            return self._attempt_completion(
+                {k: v for k, v in kwargs.items() if k != "temperature"},
+                allow_temperature_drop=False,
             )
         except litellm.BadRequestError:
             # Fallback: json_object mode - the system prompt describes the schema.

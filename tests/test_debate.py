@@ -509,6 +509,15 @@ def test_category_name_collides_with_generated_audit_column_raises(sentiment_cat
 def test_cli_default_and_overridden_model_routing(categories, monkeypatch, tmp_path):
     from query_classification import cli
 
+    # This test asserts on exact, unprefixed model-id strings, so it must not
+    # be affected by a developer's real .env possibly setting
+    # DEFAULT_LLM_PROVIDER=cerebus. main() calls load_dotenv(override=True),
+    # which re-reads the real .env file and would silently re-set that var
+    # (clobbering a plain monkeypatch.delenv) and prefix every constructed
+    # model id here — no-op load_dotenv so only this test's own env applies.
+    monkeypatch.setattr(cli, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.delenv("DEFAULT_LLM_PROVIDER", raising=False)
+
     input_csv = tmp_path / "in.csv"
     pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
 

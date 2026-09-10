@@ -5,19 +5,24 @@
 
 ## Overview
 
-Adds an opt-in `--cerebus` flag to both entry points (`classify.py`/`cli.py` and
-`experiment.py`) that routes every LLM call through Cerebus — an internal LLM gateway
-built on [Portkey](https://portkey.ai/) — instead of a direct provider. Credentials
-resolve from an env var first, falling back to AWS Secrets Manager. This spec is written
-**retroactively**: the feature was already implemented and tested in this session before
-being formalized here, so every requirement below describes verified, shipped behavior in
+Adds an opt-in `--cerebus` flag (or, equivalently, `DEFAULT_LLM_PROVIDER=cerebus` in
+`.env`) to both entry points (`classify.py`/`cli.py` and `experiment.py`) that routes
+every LLM call through Cerebus — an internal LLM gateway built on
+[Portkey](https://portkey.ai/) — instead of a direct provider. Credentials resolve from
+an env var first, falling back to AWS Secrets Manager. This spec is written
+**retroactively**: the feature was already implemented and tested before being formalized
+here, so every requirement below describes verified, shipped behavior in
 `src/query_classification/classifier.py`, `cli.py`, and `experiment.py`, plus
-`tests/test_cerebus.py` (32 tests, all passing) — not a greenfield design. A first draft
-of this spec was critiqued by Codex (`spec/3-cerebus-gateway/critique-v-1-codex.md`),
-which found several places where the spec's prose overstated what the code did, plus three
-real gaps (a security issue in the `--api-base` override, unsanitized error text, and a
-test-import-boundary conflict with `INV-7`) — all fixed in the code before this version of
-the spec was written, so the text below matches the corrected implementation.
+`tests/test_cerebus.py` (44 tests, all passing) — not a greenfield design.
+
+This is the **second** update to this closed spec, both retroactive: v1's critique found
+and fixed three real gaps (a security issue in the `--api-base` override, unsanitized
+error text, and a test-import-boundary conflict with `INV-7`). This update folds in two
+more rounds of real-world usage: a minimal-footprint configuration mode (matching a
+sibling repo's `DEFAULT_LLM_PROVIDER=cerebus` convention, requested after the original
+per-variable setup proved more configuration than needed) and a fix for reasoning models
+that reject an explicit `temperature` outright (discovered when actually running requests
+through Cerebus). See the Change Log at the end for exactly what changed and why.
 
 ## Goals
 
@@ -48,42 +53,61 @@ wiring duplicated across `cli.py` and `experiment.py`.
 
 ### Functional Requirements
 
-#### FR-1.1: `--cerebus` is an opt-in boolean flag, available everywhere a `Classifier` is constructed
+#### FR-1.1: Cerebus routing is enabled by `--cerebus` or `DEFAULT_LLM_PROVIDER=cerebus` — either one, checked once at startup
 `classify.py`/`cli.py` gets one `--cerebus` flag (this entry point has no subcommands).
 `experiment.py` gets the same flag in its **common** argument group, so it's available on
 `induce`, `classify`, and `run` alike — induction calls need gateway routing exactly as
-much as classification calls do. Argparse defaults it to `False`. When it's not passed,
-the `Classifier` instances constructed are given `api_key=None, extra_headers=None` (the
-same as before this feature existed), so the resulting `litellm.completion(...)` kwargs
-are unchanged — omitting `--cerebus` is a no-op, not merely "close to" one.
+much as classification calls do. Argparse defaults it to `False`. Immediately after
+parsing, both entry points also OR it with `cerebus_enabled_via_env()` — `True` iff
+`DEFAULT_LLM_PROVIDER` (case-insensitively, after stripping whitespace) equals
+`"cerebus"` — so a `.env`-only setup (no flag needed at all) works identically to passing
+`--cerebus` explicitly; this is the minimal-footprint path matching the convention used in
+a sibling internal repo, and is the intended way to leave Cerebus "on" for every
+invocation without repeating the flag. When *neither* is set, the `Classifier` instances
+constructed are given `api_key=None, extra_headers=None` (the same as before this feature
+existed), so the resulting `litellm.completion(...)` kwargs are unchanged — this remains a
+true no-op, not merely "close to" one.
 **Verify:** `build_parser()` in both `cli.py` and `experiment.py` accepts `--cerebus` and
-defaults it to `False`; `experiment.py`'s parser accepts it on all three subcommands.
+defaults it to `False`; `experiment.py`'s parser accepts it on all three subcommands;
+`cerebus_enabled_via_env()` returns `True` for `"cerebus"`/`"Cerebus"`/`" CEREBUS "` and
+`False` for any other value or when unset; a real, minimal `.env` containing only
+`DEFAULT_LLM_PROVIDER=cerebus` (+ optionally `CEREBUS_API_KEY`) and no `--cerebus` flag at
+all produces gateway-routed `Classifier` instances on both entry points, using every
+other default this spec defines (FR-1.2).
 
-#### FR-1.2: `CEREBUS_MODE` selects Azure-config-mode or direct-slug-mode gateway addressing
-Cerebus/Portkey supports two addressing styles, selected by the exact (case-sensitive,
-untrimmed) string `CEREBUS_MODE=azure` or `CEREBUS_MODE=direct` — any other value,
-including unset, whitespace-only, or differently-cased, is a configuration error:
+#### FR-1.2: `CEREBUS_MODE` selects Azure-config-mode or direct-slug-mode gateway addressing, defaulting to `direct`
+Cerebus/Portkey supports two addressing styles, selected by the string
+`CEREBUS_MODE=azure` or `CEREBUS_MODE=direct` — **unset means `direct`** (this is the
+common case: no per-model configuration needed); any *explicitly set but not exactly*
+`azure`/`direct` value is a configuration error:
 - **`azure`**: an Azure-backed model, addressed by a Portkey **Config ID** sent as the
   `x-portkey-config` header, reading the gateway URL from `CEREBUS_GATEWAY_AZURE_URL`.
+  `CEREBUS_CONFIG_ID` has no default (it is workspace- and model-specific) and is a
+  configuration error if missing — this is the one piece of required, non-defaulted
+  configuration left in this feature.
 - **`direct`**: a directly-hosted model (OpenAI, Gemini, ...), addressed by whatever value
   `--model` (or the relevant per-role flag) already holds, sent with an
   `x-portkey-provider: openai` header, reading the gateway URL from
   `CEREBUS_GATEWAY_DIRECT_URL`.
 
-Mode-specific configuration (`CEREBUS_GATEWAY_AZURE_URL`/`CEREBUS_CONFIG_ID` for `azure`;
-`CEREBUS_GATEWAY_DIRECT_URL` for `direct`) is validated for presence **before** the API key
-is resolved (Feature 2) — so a configuration mistake surfaces immediately rather than
-being masked behind, or delayed by, a slow/failing AWS Secrets Manager call. All values
-(mode, URLs, config ID) are checked for truthiness only: whitespace-only strings pass, and
-URLs are not parsed or scheme-validated (beyond the separate HTTPS requirement on an
-`--api-base` override, FR-1.4) — this permissiveness is deliberate scope-limiting, not an
-oversight (see Constraints).
-**Verify:** `CEREBUS_MODE` unset or set to a value other than exactly `azure`/`direct`
-raises `ValueError` naming the invalid value, without attempting key resolution; `azure`
-mode without `CEREBUS_GATEWAY_AZURE_URL` or without `CEREBUS_CONFIG_ID` each raise
-`ValueError` naming the missing variable, before any AWS call; `direct` mode without
-`CEREBUS_GATEWAY_DIRECT_URL` raises `ValueError`; each mode's success path returns the
-documented `api_base` + header shape (AR-1.2).
+Both gateway URLs (`CEREBUS_GATEWAY_AZURE_URL`/`CEREBUS_GATEWAY_DIRECT_URL`) default to
+this org's shared nonprod Cerebus endpoints when not overridden — the same
+"ship a working default, allow override" treatment already given to Feature 2's AWS
+Secrets Manager coordinates (FR-2.2), extended here to the gateway URLs themselves. Mode
+validation (and `CEREBUS_CONFIG_ID`'s presence, in `azure` mode) happens **before** the
+API key is resolved (Feature 2) — so a configuration mistake surfaces immediately rather
+than being masked behind, or delayed by, a slow/failing AWS Secrets Manager call. All
+values are checked for truthiness only: whitespace-only strings pass, and URLs are not
+parsed or scheme-validated (beyond the separate HTTPS requirement on an `--api-base`
+override, FR-1.4) — this permissiveness is deliberate scope-limiting, not an oversight
+(see Constraints).
+**Verify:** `CEREBUS_MODE` unset resolves to `direct` mode without raising; set to a value
+other than exactly `azure`/`direct` raises `ValueError` naming the invalid value, without
+attempting key resolution; `azure` mode without `CEREBUS_CONFIG_ID` raises `ValueError`
+naming the missing variable, before any AWS call; both gateway URLs resolve to their
+documented defaults when their respective env vars are unset, and to the overridden value
+when set; each mode's success path returns the documented `api_base` + header shape
+(AR-1.2).
 
 #### FR-1.3: The model id is auto-prefixed for LiteLLM's OpenAI-compatible routing
 LiteLLM only treats a custom `api_base` as a generic OpenAI-compatible chat-completions
@@ -154,9 +178,37 @@ stdout and exits with status 1; this "clean error, not a bare traceback" guarant
 for both `main()` entry points, not for `classifier.py`'s functions called directly as a
 library (a caller importing `build_cerebus_completion_kwargs` directly gets the raw
 `ValueError`/`RuntimeError`, by design — `main()` is what adds the catch-and-print layer).
-**Verify:** `experiment.py classify --cerebus` with `CEREBUS_MODE` unset exits 1, prints an
-error (to stdout) naming `CEREBUS_MODE`, and creates no `--run-dir` at all; the equivalent
-`cli.py` invocation exits 1 before writing any output file.
+**Verify:** `experiment.py classify --cerebus` with `CEREBUS_MODE` set to an invalid value
+exits 1, prints an error (to stdout) naming `CEREBUS_MODE`, and creates no `--run-dir` at
+all; the equivalent `cli.py` invocation exits 1 before writing any output file.
+
+#### FR-1.7: A model that rejects an explicit `temperature` is retried once without it
+Some models — reasoning models encountered through Cerebus in particular (e.g.
+`gpt-5.4-mini` variants), though this applies to any provider/model `Classifier` talks to,
+with or without `--cerebus` — reject an explicit `temperature` entirely while reasoning is
+active, raising `litellm.UnsupportedParamsError`; only their own fixed default (typically
+`1`) is accepted. Since only the `--critics` sampling role ever sets `self.temperature` at
+all (every other role already omits it), this surfaces exclusively there. `Classifier`
+catches `UnsupportedParamsError` specifically — checked **before** the pre-existing,
+broader `except litellm.BadRequestError` fallback (structured-output vs. JSON-object
+mode), since `UnsupportedParamsError` is itself a subclass of `BadRequestError` in the
+installed `litellm` version and would otherwise be misdiagnosed as "structured output
+unsupported," retried in JSON-object mode with the *same* still-unsupported `temperature`,
+and fail again for the identical reason — and retries the call exactly once with
+`temperature` dropped from the request. This happens **within** the single completion
+attempt, before it can ever reach `classify()`'s own outer retry loop (`--retries`) — a
+model that structurally cannot accept `temperature` will never succeed by retrying with it
+again, so surfacing this immediately (rather than exhausting all `--retries` attempts on
+an identical, deterministic failure) is the correct behavior regardless of how many
+retries are configured. If the retried (temperature-dropped) call *also* raises
+`UnsupportedParamsError`, it propagates rather than looping — there is nothing left this
+mechanism can drop, and a second failure needs surfacing, not another silent retry.
+**Verify:** a fake `litellm.completion` that raises `UnsupportedParamsError` only when
+`temperature` is present in the call succeeds on `Classifier._complete()`'s automatic
+retry, with exactly two calls made (one failed with `temperature`, one successful without);
+a `Classifier` with no `temperature` set at all re-raises `UnsupportedParamsError`
+immediately (nothing to drop); a fake that raises `UnsupportedParamsError` unconditionally
+(even after `temperature` is dropped) re-raises rather than recursing a second time.
 
 ### Architectural Requirements
 
@@ -178,11 +230,16 @@ when set to a truthy value.
 One function, `build_cerebus_completion_kwargs() -> dict`, validates the `CEREBUS_MODE`
 routing configuration described in FR-1.2, resolves the API key (Feature 2), and returns
 `{"api_base": ..., "api_key": ..., "extra_headers": {...}}` — the exact kwargs `cli.py`/
-`experiment.py` merge into every `Classifier(...)` call under `--cerebus`. Applying the
-`--api-base` override (FR-1.4, including its HTTPS check) and the `openai/` model-id
-prefix (FR-1.3) are call-site responsibilities, not something this function does itself —
+`experiment.py` merge into every `Classifier(...)` call under `--cerebus`. A second,
+smaller function, `cerebus_enabled_via_env() -> bool` (FR-1.1), lives alongside it and is
+the only place `DEFAULT_LLM_PROVIDER` is read. Applying the `--api-base` override (FR-1.4,
+including its HTTPS check) and the `openai/` model-id prefix (FR-1.3) are call-site
+responsibilities, not something `build_cerebus_completion_kwargs()` does itself —
 `experiment.py` centralizes both into its own `_resolve_gateway_kwargs` helper (FR-1.5);
-`cli.py` inlines the equivalent logic directly in `main()`.
+`cli.py` inlines the equivalent logic directly in `main()`. Both entry points OR
+`cerebus_enabled_via_env()` into `args.cerebus` immediately after parsing (`args.cerebus =
+args.cerebus or cerebus_enabled_via_env()`), so every downstream check — construction,
+model-id prefixing, the `run_config.json` field — only ever needs to read `args.cerebus`.
 **Verify:** the function's return value's three keys map 1:1 onto `Classifier`'s
 `api_base`/`api_key`/`extra_headers` constructor parameters.
 
@@ -345,21 +402,30 @@ existing rule that `run_config.json` never records `--api-base`'s value or any c
 ## Integration Points
 
 - `src/query_classification/classifier.py` — gains `_resolve_cerebus_api_key`,
-  `build_cerebus_completion_kwargs`, `cerebus_model_id`, `reject_insecure_cerebus_endpoint`,
-  and `Classifier`'s new `api_key`/`extra_headers` params. All other existing functions
+  `build_cerebus_completion_kwargs`, `cerebus_enabled_via_env`, `cerebus_model_id`,
+  `reject_insecure_cerebus_endpoint`, and `Classifier`'s new `api_key`/`extra_headers`
+  params. `Classifier._complete()` is restructured into `_complete()` +
+  `_attempt_completion(kwargs, *, allow_temperature_drop)` for FR-1.7 — a change that
+  applies regardless of `--cerebus`, since it's a general `Classifier` robustness fix
+  discovered via Cerebus usage, not gateway-specific logic. All other existing functions
   unchanged.
-- `src/query_classification/cli.py` — gains `--cerebus`; resolves gateway kwargs once in
-  `main()` (including the HTTPS check) and merges them into every `Classifier`
-  construction site.
+- `src/query_classification/cli.py` — gains `--cerebus`; ORs in `cerebus_enabled_via_env()`
+  right after parsing; resolves gateway kwargs once in `main()` (including the HTTPS
+  check) and merges them into every `Classifier` construction site.
 - `src/query_classification/experiment.py` — gains `--cerebus` on the shared `common`
-  argument group; a new `_resolve_gateway_kwargs` helper resolves gateway kwargs once in
-  `main()` and threads them through both `_construct_classifiers` calls; `run_config.json`
-  gains the `cerebus` field.
+  argument group; ORs in `cerebus_enabled_via_env()` right after parsing; a
+  `_resolve_gateway_kwargs` helper resolves gateway kwargs once in `main()` and threads
+  them through both `_construct_classifiers` calls; `run_config.json` gains the `cerebus`
+  field.
 - `pyproject.toml` — new `[project.optional-dependencies] cerebus = ["boto3"]`.
-- `.env.example` (and the developer's own `.env`) — new `CEREBUS_*` placeholder variables.
-- `tests/test_cerebus.py` — new test file (32 tests).
-- `README.md` — new "Cerebus / Portkey gateway" section, `--cerebus` row in the Options
-  table, and a note on the experiment runner's flag availability.
+- `.env.example` (and the developer's own `.env`) — `DEFAULT_LLM_PROVIDER=cerebus` +
+  `CEREBUS_API_KEY` as the documented minimal path; the per-variable `CEREBUS_MODE`/
+  `CEREBUS_GATEWAY_*_URL`/`CEREBUS_CONFIG_ID`/AWS-coordinate overrides moved to an
+  "Advanced" subsection.
+- `tests/test_cerebus.py` — test file, now 44 tests.
+- `README.md` — "Cerebus / Portkey gateway" section leads with the minimal setup, then
+  the advanced per-variable overrides; `--cerebus` row in the Options table; a note on the
+  experiment runner's flag availability.
 - `spec/3-cerebus-gateway/ADR.md` — INV-7 amendment (AR-1.4), folded into
   `spec/ARCHITECTURE.md` by `/spec-close`.
 
@@ -402,12 +468,12 @@ existing rule that `run_config.json` never records `--api-base`'s value or any c
   other way around. An operator who exports `CEREBUS_API_KEY` in their shell expecting it
   to take precedence over a stale/placeholder `.env` entry will be surprised; this is an
   existing repo-wide behavior this spec inherits rather than changes.
-- **Gateway endpoint values are user-supplied, not defaulted.** `CEREBUS_GATEWAY_AZURE_URL`/
-  `CEREBUS_GATEWAY_DIRECT_URL`/`CEREBUS_CONFIG_ID` ship as empty placeholders in
-  `.env.example` — this repo does not assume access to any particular Elsevier Portkey
-  workspace, unlike the AWS Secrets Manager coordinates (FR-2.2), which do ship with
-  working defaults since they identify secret *coordinates*, not workspace-specific
-  routing.
+- **`CEREBUS_CONFIG_ID` is the one value left without a default.** Both gateway URLs now
+  default to this org's shared nonprod endpoints (FR-1.2) and the AWS Secrets Manager
+  coordinates already had working defaults (FR-2.2) — `CEREBUS_CONFIG_ID` is deliberately
+  the exception, since a Portkey Config ID is workspace- *and* model-specific with no
+  sensible org-wide default; it's required only when `CEREBUS_MODE=azure` is explicitly
+  chosen, never for the default `direct` mode.
 - **Gateway latency and availability become a shared dependency for every LLM call under
   `--cerebus`.** This adds a network hop (and, transitively, Cerebus/Portkey's own
   availability and rate limits) to every request `Classifier.classify` makes, on top of
@@ -428,8 +494,6 @@ existing rule that `run_config.json` never records `--api-base`'s value or any c
   handling** — the sibling-repo pattern this feature was modeled on has per-model
   bookkeeping (`RESPONSES_API_MODELS`, `CEREBUS_DEPLOYMENTS`) for a much larger model
   surface than this tool exposes; none of that is replicated.
-- **A `DEFAULT_LLM_PROVIDER`-style env-var toggle** — this repo uses an explicit `--cerebus`
-  flag instead of an env-var-driven default provider switch.
 - **A full endpoint allowlist for `--api-base` overrides** — FR-1.4's HTTPS-only check is a
   minimal guard, not a trust boundary against a malicious `--api-base` value; the value is
   the user's own CLI flag.
@@ -451,10 +515,12 @@ existing rule that `run_config.json` never records `--api-base`'s value or any c
 ## Spec Completeness Checklist
 
 - [x] **Scope & acceptance criteria** — every FR carries a **Verify:** condition; Out of
-  Scope names eight explicitly excluded directions.
-- [x] **Testing strategy** — `tests/test_cerebus.py` (32 tests) covers every FR-1.x/FR-2.x
+  Scope names seven explicitly excluded directions.
+- [x] **Testing strategy** — `tests/test_cerebus.py` (44 tests) covers every FR-1.x/FR-2.x
   Verify condition, including CLI-level success-path wiring checks (AR-2.2) added after
-  this spec's critique found the original draft's end-to-end claims untested.
+  this spec's v1 critique found the original draft's end-to-end claims untested, plus the
+  minimal-footprint (FR-1.1) and temperature-drop (FR-1.7) end-to-end tests added in this
+  update.
 - [x] **Existing patterns** — modeled explicitly on Spec 2's lazy-optional-dependency
   pattern (`datasets`/`hf` extra), this repo's existing `.env`/`python-dotenv` convention,
   and `dataset_io.py`'s/`induction.py`'s sanitized-failure convention (FR-2.4).
@@ -482,3 +548,44 @@ existing rule that `run_config.json` never records `--api-base`'s value or any c
   access presumed for gateway URLs; AWS coordinates default to a shared, previously-working
   secret path that may not apply to every AWS account; minimal input validation; gateway
   compatibility with structured-output requests unverified).
+
+---
+
+## Change Log
+
+### Update (this version) — retroactive, two rounds of real-world usage
+
+**Applied:**
+- **Minimal-footprint configuration.** `CEREBUS_MODE` now defaults to `direct` instead of
+  being required (FR-1.2); both `CEREBUS_GATEWAY_AZURE_URL`/`CEREBUS_GATEWAY_DIRECT_URL`
+  now default to this org's shared nonprod endpoints instead of being required; a new
+  `cerebus_enabled_via_env()` lets `DEFAULT_LLM_PROVIDER=cerebus` in `.env` turn on
+  gateway routing without ever passing `--cerebus` (FR-1.1, AR-1.2). Net effect: the
+  minimal real-world setup is `DEFAULT_LLM_PROVIDER=cerebus` + optional `CEREBUS_API_KEY`,
+  matching the convention from a sibling internal repo. `CEREBUS_CONFIG_ID` remains the
+  one required, non-defaulted value, and only when `CEREBUS_MODE=azure` is explicitly
+  chosen.
+- **Temperature-compatibility fix (new FR-1.7).** Some models (reasoning models
+  encountered through Cerebus, e.g. `gpt-5.4-mini` variants) reject an explicit
+  `temperature` entirely, raising `litellm.UnsupportedParamsError` — discovered running a
+  real experiment through the gateway, where it silently burned all 3 `--retries` attempts
+  on an identical, unfixable-by-retrying failure. `Classifier._complete()` now catches
+  `UnsupportedParamsError` specifically (checked *before* the pre-existing broader
+  `BadRequestError` fallback, since `UnsupportedParamsError` is itself a `BadRequestError`
+  subclass in the installed `litellm` version — an ordering subtlety caught by a mutation
+  test during implementation, not merely inferred) and retries once with `temperature`
+  dropped.
+- Corrected two now-stale claims from v1: "gateway endpoint values are user-supplied, not
+  defaulted" (Constraints) and "a `DEFAULT_LLM_PROVIDER`-style env-var toggle" being out
+  of scope (Out of Scope) — both are now the opposite of current behavior, so the text was
+  rewritten rather than left contradicting the implementation.
+- Test count: 32 → 44 (`tests/test_cerebus.py`); full suite 148 passing.
+
+**Rejected:** none — both changes were user-requested/discovered-in-use and already
+verified against the running code before this update; there was nothing to weigh against
+adding scope the user didn't ask for.
+
+**Reorganized:** none structurally — both changes fit into existing Feature 1 FRs/AR-1.2
+(the mode/URL defaults into FR-1.2; the new trigger into FR-1.1; the temperature fix as a
+new FR-1.7, since it's discovered-via-Cerebus but is itself gateway-independent
+`Classifier` behavior, kept in Feature 1 rather than split into its own Feature for one FR).

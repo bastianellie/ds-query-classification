@@ -40,6 +40,7 @@ from query_classification.categories import Category, Label, load_categories
 from query_classification.classifier import (
     Classifier,
     build_cerebus_completion_kwargs,
+    cerebus_enabled_via_env,
     cerebus_model_id,
     reject_insecure_cerebus_endpoint,
 )
@@ -145,10 +146,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Route every LLM call (classification, critic/reconciler, induction) "
         "through the Cerebus/Portkey gateway instead of a direct provider. "
-        "Configure via CEREBUS_MODE/CEREBUS_GATEWAY_*_URL/CEREBUS_CONFIG_ID/"
-        "CEREBUS_API_KEY in .env (see .env.example). --model and friends still "
-        "name the underlying model/slug; --api-base overrides the gateway URL "
-        "if explicitly given.",
+        "Equivalent to setting DEFAULT_LLM_PROVIDER=cerebus in .env (either one "
+        "turns it on). Minimal setup: DEFAULT_LLM_PROVIDER=cerebus + optional "
+        "CEREBUS_API_KEY in .env — see .env.example for advanced overrides "
+        "(CEREBUS_MODE/CEREBUS_GATEWAY_*_URL/CEREBUS_CONFIG_ID). --model and "
+        "friends still name the underlying model/slug; --api-base overrides the "
+        "gateway URL if explicitly given.",
     )
 
     induction = argparse.ArgumentParser(add_help=False)
@@ -190,7 +193,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers", type=int, default=8, metavar="N", help="Concurrent worker threads (default: 8)"
     )
     classification.add_argument(
-        "--limit", type=int, metavar="N", help="Classify only the first N rows of the test split"
+        "--test-limit",
+        type=int,
+        metavar="N",
+        help="Classify only the first N rows of the test split (omit to classify all rows)",
     )
     classification.add_argument("--system-prompt", metavar="FILE", help="Custom system prompt template")
     classification.add_argument(
@@ -292,8 +298,8 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be >= 1, got {value}")
     if getattr(args, "seed", None) is not None and args.seed < 0:
         raise ValueError(f"--seed must be >= 0, got {args.seed}")
-    if getattr(args, "limit", None) is not None and args.limit < 0:
-        raise ValueError(f"--limit must be >= 0, got {args.limit}")
+    if getattr(args, "test_limit", None) is not None and args.test_limit < 0:
+        raise ValueError(f"--test-limit must be >= 0, got {args.test_limit}")
 
     if getattr(args, "critics", False):
         if not math.isfinite(args.sampling_temperature):
@@ -593,6 +599,9 @@ def main() -> None:
     load_dotenv(override=True)
     _quiet_logging()
     args = build_parser().parse_args()
+    # DEFAULT_LLM_PROVIDER=cerebus is an alternative to --cerebus, for a
+    # set-it-in-.env-and-forget-it setup; either one turns gateway routing on.
+    args.cerebus = args.cerebus or cerebus_enabled_via_env()
 
     try:
         _log_phase("validating")
@@ -661,7 +670,7 @@ def main() -> None:
                 "allow_new_labels": args.allow_new_labels,
                 "retries": args.retries,
                 "workers": args.workers,
-                "limit": args.limit,
+                "test_limit": args.test_limit,
             }
             if will_classify
             else None
@@ -826,8 +835,8 @@ def main() -> None:
                     f"source column(s) of the same name"
                 )
 
-            if args.limit is not None:
-                test_df = test_df.iloc[: args.limit].reset_index(drop=True)
+            if args.test_limit is not None:
+                test_df = test_df.iloc[: args.test_limit].reset_index(drop=True)
 
             test_csv_path = run_dir / "test.csv"
             test_df.to_csv(test_csv_path, index=False)

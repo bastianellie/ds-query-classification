@@ -15,6 +15,7 @@ from query_classification.categories import load_categories
 from query_classification.classifier import (
     Classifier,
     build_cerebus_completion_kwargs,
+    cerebus_enabled_via_env,
     cerebus_model_id,
     reject_insecure_cerebus_endpoint,
 )
@@ -168,10 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--cerebus",
         action="store_true",
         help="Route every LLM call through the Cerebus/Portkey gateway instead "
-        "of a direct provider. Configure via CEREBUS_MODE/CEREBUS_GATEWAY_*_URL/"
-        "CEREBUS_CONFIG_ID/CEREBUS_API_KEY in .env (see .env.example). --model "
-        "and friends still name the underlying model/slug; --api-base overrides "
-        "the gateway URL if explicitly given.",
+        "of a direct provider. Equivalent to setting DEFAULT_LLM_PROVIDER=cerebus "
+        "in .env (either one turns it on). Minimal setup: DEFAULT_LLM_PROVIDER=cerebus "
+        "+ optional CEREBUS_API_KEY in .env — see .env.example for advanced overrides "
+        "(CEREBUS_MODE/CEREBUS_GATEWAY_*_URL/CEREBUS_CONFIG_ID). --model and friends "
+        "still name the underlying model/slug; --api-base overrides the gateway URL "
+        "if explicitly given.",
     )
     return parser
 
@@ -188,6 +191,9 @@ def main() -> None:
     load_dotenv(override=True)
     _quiet_logging()
     args = build_parser().parse_args()
+    # DEFAULT_LLM_PROVIDER=cerebus is an alternative to --cerebus, for a
+    # set-it-in-.env-and-forget-it setup; either one turns gateway routing on.
+    args.cerebus = args.cerebus or cerebus_enabled_via_env()
 
     try:
         uses_bundled_defaults = (
