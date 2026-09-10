@@ -643,3 +643,110 @@ def test_sampling_temperature_included_in_completion_kwargs():
     assert c._completion_kwargs([])["temperature"] == 0.7
     c_default = Classifier("m", "sp", model)
     assert "temperature" not in c_default._completion_kwargs([])
+
+
+# --- classify_csv's classifier/models public-API validation (spec 4, AR-1.2) -
+
+
+class DummyModel:
+    def classify(self, text):
+        return {"sentiment": ["positive"]}
+
+
+def test_classify_csv_rejects_neither_classifier_nor_models(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        with pytest.raises(ValueError, match="exactly one of classifier or models"):
+            classify_csv(input_csv, "text", None, categories, output_path=out)
+        assert not out.exists()
+
+
+def test_classify_csv_rejects_both_classifier_and_models(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        models = {"a": DummyModel(), "b": DummyModel()}
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            classify_csv(
+                input_csv, "text", DummyModel(), categories, output_path=out, models=models
+            )
+        assert not out.exists()
+
+
+def test_classify_csv_rejects_critics_with_models(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        models = {"a": DummyModel(), "b": DummyModel()}
+        with pytest.raises(ValueError, match="critics and models are mutually exclusive"):
+            classify_csv(
+                input_csv, "text", None, categories, output_path=out,
+                critics=True, models=models,
+                critic_classifiers={"sentiment": FakeCritic()},
+                reconciler_classifiers={"sentiment": FakeReconciler()},
+            )
+        assert not out.exists()
+
+
+def test_classify_csv_rejects_empty_models_dict(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        with pytest.raises(ValueError, match="at least 2 entries"):
+            classify_csv(input_csv, "text", None, categories, output_path=out, models={})
+        assert not out.exists()
+
+
+def test_classify_csv_rejects_single_model(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        with pytest.raises(ValueError, match="at least 2 entries"):
+            classify_csv(
+                input_csv, "text", None, categories, output_path=out,
+                models={"a": DummyModel()},
+            )
+        assert not out.exists()
+
+
+def test_classify_csv_rejects_whitespace_only_model_key(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        models = {"a": DummyModel(), "   ": DummyModel()}
+        with pytest.raises(ValueError, match="non-empty"):
+            classify_csv(input_csv, "text", None, categories, output_path=out, models=models)
+        assert not out.exists()
+
+
+def test_classify_csv_models_mode_rejects_cross_category_audit_collision():
+    # A category literally named "sentiment_by_model" collides with the
+    # "sentiment" category's own generated audit column (INV-8).
+    colliding_categories = [
+        Category(name="sentiment", description="d", labels=[Label(value="positive", description="p")]),
+        Category(name="sentiment_by_model", description="d", labels=[Label(value="x", description="x")]),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        models = {"a": DummyModel(), "b": DummyModel()}
+        with pytest.raises(ValueError, match="both generate column"):
+            classify_csv(
+                input_csv, "text", None, colliding_categories, output_path=out, models=models
+            )
+        assert not out.exists()

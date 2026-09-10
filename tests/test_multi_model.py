@@ -2,21 +2,23 @@
 calls). Covers spec 4's FR-1.x/AR-1.x Verify conditions via fake, duck-typed
 Classifier-shaped objects (any object exposing ``.classify(text) -> dict``).
 
-These tests call ``run_multi_model`` directly rather than through
-``classify_csv`` — the end-to-end/restore tests that need the real
-``classify_csv`` (which only gains its ``models`` parameter in the pipeline.py
-task) live in this same file, appended once that task lands.
+Two groups: orchestration-level tests calling ``run_multi_model`` directly,
+and end-to-end/restore tests going through the real ``classify_csv``.
 """
 
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import time
+from pathlib import Path
 
+import pandas as pd
 import pytest
 
-from query_classification import Category, Label
+from query_classification import Category, Label, classify_csv
+from query_classification import multi_model
 from query_classification.multi_model import run_multi_model
 
 
@@ -216,3 +218,135 @@ def test_malformed_category_fails_whole_row_for_that_model(sentiment_category, u
         assert "c" not in by_model
         errors = json.loads(result[f"{cat_name}_model_errors"])
         assert "c" in errors
+
+
+# --- End-to-end via classify_csv + restore (FR-1.4/FR-1.5/FR-1.6) --------
+
+
+def test_audit_columns_end_to_end_via_classify_csv(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        models = {
+            "a": FakeModel({"sentiment": ["positive"]}),
+            "b": FakeModel({"sentiment": ["positive"]}),
+            "c": FakeModel({"sentiment": ["negative"]}),
+        }
+        classify_csv(
+            input_csv, "text", None, categories, output_path=out,
+            models=models, allow_new_labels=False,
+        )
+        result = pd.read_csv(out)
+        for suffix in multi_model.AUDIT_COLUMN_SUFFIXES:
+            assert f"sentiment{suffix}" in result.columns
+        assert result.loc[0, "sentiment"] == "['positive']"
+
+
+def test_restore_requires_all_multi_model_audit_columns_not_just_category_value(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"], "sentiment": ["['positive']"]}).to_csv(input_csv, index=False)
+
+        # sentiment is filled but sentiment_by_model is absent -> not "done" -> reprocessed.
+        out = d / "out.csv"
+        models = {
+            "a": FakeModel({"sentiment": ["positive"]}),
+            "b": FakeModel({"sentiment": ["positive"]}),
+        }
+        classify_csv(
+            input_csv, "text", None, categories, output_path=out, restore=True,
+            models=models, allow_new_labels=False,
+        )
+        result = pd.read_csv(out)
+        assert pd.notna(result.loc[0, "sentiment_by_model"])
+
+
+def test_restore_from_separate_completed_output_skips_done_rows(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a", "b"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        pd.DataFrame(
+            {
+                "text": ["a", "b"],
+                "sentiment": ["['positive']", "['negative']"],
+                "sentiment_votes": ['{"positive": 2}', '{"negative": 2}'],
+                "sentiment_by_model": [
+                    '{"a": ["positive"], "b": ["positive"]}',
+                    '{"a": ["negative"], "b": ["negative"]}',
+                ],
+                "sentiment_model_errors": ["{}", "{}"],
+            }
+        ).to_csv(out, index=False)
+
+        class BoomModel:
+            def classify(self, text):
+                raise AssertionError("should not be called: row already done")
+
+        models = {"a": BoomModel(), "b": BoomModel()}
+        classify_csv(
+            input_csv, "text", None, categories, output_path=out, restore=True,
+            models=models, allow_new_labels=False,
+        )  # must not raise
+
+
+def test_stale_audit_values_reset_on_fresh_non_restore_run(categories):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame(
+            {
+                "text": ["a"],
+                "sentiment": ["['stale']"],
+                "sentiment_votes": ['{"stale": 99}'],
+            }
+        ).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        models = {
+            "a": FakeModel({"sentiment": ["positive"]}),
+            "b": FakeModel({"sentiment": ["positive"]}),
+        }
+        classify_csv(
+            input_csv, "text", None, categories, output_path=out,
+            models=models, allow_new_labels=False,
+        )
+        result = pd.read_csv(out)
+        assert "stale" not in result.loc[0, "sentiment_votes"]
+
+
+def test_total_model_failure_increments_classified_not_failed_counter(categories, monkeypatch):
+    postfix_calls = []
+
+    class RecordingProgress:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def update(self, n):
+            pass
+
+        def set_postfix(self, **kwargs):
+            postfix_calls.append(dict(kwargs))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("query_classification.pipeline.tqdm", RecordingProgress)
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        input_csv = d / "in.csv"
+        pd.DataFrame({"text": ["a"]}).to_csv(input_csv, index=False)
+        out = d / "out.csv"
+        models = {"a": FakeModel(raises=True), "b": FakeModel(raises=True)}
+        classify_csv(
+            input_csv, "text", None, categories, output_path=out,
+            models=models, allow_new_labels=False,
+        )
+        result = pd.read_csv(out)
+        assert pd.isna(result.loc[0, "sentiment"])
+
+    assert postfix_calls[-1] == {"ok": 1, "failed": 0}

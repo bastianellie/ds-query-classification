@@ -14,21 +14,21 @@ from typing import Any
 import pandas as pd
 from tqdm import tqdm
 
-from query_classification import debate
+from query_classification import debate, multi_model
 from query_classification.categories import Category
 from query_classification.classifier import Classifier
 
 
-def _audit_columns(category_name: str) -> set[str]:
-    """The audit-trail columns a category generates under ``--critics`` (not
-    including the category's own base column)."""
-    return {f"{category_name}{suffix}" for suffix in debate.AUDIT_COLUMN_SUFFIXES}
+def _audit_columns(category_name: str, audit_suffixes: tuple[str, ...]) -> set[str]:
+    """The audit-trail columns a category generates under ``--critics``/
+    ``--models`` (not including the category's own base column)."""
+    return {f"{category_name}{suffix}" for suffix in audit_suffixes}
 
 
 def classify_csv(
     input_path: str | Path,
     column: str,
-    classifier: Classifier,
+    classifier: Classifier | None,
     categories: list[Category],
     output_path: str | Path | None = None,
     restore: bool = False,
@@ -41,6 +41,7 @@ def classify_csv(
     sampling_runs: int = 5,
     consensus_threshold: int = 4,
     allow_new_labels: bool = False,
+    models: dict[str, Classifier] | None = None,
 ) -> Path:
     """Classify ``column`` of the input CSV and write the augmented CSV.
 
@@ -50,13 +51,19 @@ def classify_csv(
     to disk every ``save_every`` completed rows (and once at the end) so a
     crashed run can be resumed with ``restore``.
 
-    When ``critics=True``, ``classifier`` is used as the *sampling* classifier
+    Exactly one of ``classifier`` or ``models`` must be given. When
+    ``critics=True``, ``classifier`` is used as the *sampling* classifier
     (already constructed with the desired temperature by the caller) and each
     row is classified via ``debate.run_debate`` instead of a single
     ``classifier.classify`` call, using ``critic_classifiers``/
     ``reconciler_classifiers`` (one ``Classifier`` per category, keyed by
     category name). ``sampling_temperature`` itself is not a parameter here —
-    it's only meaningful at the point ``classifier`` is constructed.
+    it's only meaningful at the point ``classifier`` is constructed. When
+    ``models`` is given instead (keyed by model id, each value a distinct
+    ``Classifier``), each row is classified via
+    ``multi_model.run_multi_model`` — every model classifies the row once,
+    independently, merged by plurality vote; mutually exclusive with
+    ``critics``.
 
     Returns the path the result was written to. Defaults to overwriting the
     input file when ``output_path`` is not given.
@@ -71,6 +78,29 @@ def classify_csv(
             f"classified. Rename the category or choose a different --column; "
             f"otherwise the source text would be overwritten before classification."
         )
+
+    have_classifier = classifier is not None
+    have_models = models is not None
+    if have_classifier and have_models:
+        raise ValueError("classifier and models are mutually exclusive — provide exactly one")
+    if not have_classifier and not have_models:
+        raise ValueError("exactly one of classifier or models must be provided")
+    if critics and have_models:
+        raise ValueError("critics and models are mutually exclusive")
+    if have_models:
+        if len(models) < 2:
+            raise ValueError(f"models must have at least 2 entries, got {len(models)}")
+        empty_keys = [repr(k) for k in models if not k.strip()]
+        if empty_keys:
+            raise ValueError(f"models keys must be non-empty, got {', '.join(empty_keys)}")
+
+    audit_suffixes: tuple[str, ...] = (
+        debate.AUDIT_COLUMN_SUFFIXES
+        if critics
+        else multi_model.AUDIT_COLUMN_SUFFIXES
+        if have_models
+        else ()
+    )
 
     if critics:
         if sampling_runs < 1:
@@ -94,13 +124,15 @@ def classify_csv(
                 f"reconcilers missing {missing_reconcilers}."
             )
 
+    if audit_suffixes:
         # Collision check extended to every generated audit column: none may
         # equal the text column, and no two categories' generated column sets
         # may overlap (this also catches e.g. category "sentiment_votes"
         # colliding with category "sentiment"'s own generated audit column).
+        # Applies to both --critics and --models, whichever is active.
         owner: dict[str, str] = {}
         for cat_name in category_names:
-            generated = {cat_name, *_audit_columns(cat_name)}
+            generated = {cat_name, *_audit_columns(cat_name, audit_suffixes)}
             for col in generated:
                 if col == column:
                     raise ValueError(
@@ -123,16 +155,17 @@ def classify_csv(
             f"Column '{column}' not found. Available columns: {list(df.columns)}"
         )
 
-    # Add category columns (and, under --critics, their audit columns) if not present.
+    # Add category columns (and, under --critics/--models, their audit
+    # columns) if not present.
     for cat_name in category_names:
-        generated = {cat_name, *_audit_columns(cat_name)} if critics else {cat_name}
+        generated = {cat_name, *_audit_columns(cat_name, audit_suffixes)}
         for col in generated:
             if col not in df.columns:
                 df[col] = None
 
     # When resuming into a separate --output file, seed already-classified
-    # category columns (and audit columns, under --critics) from the prior
-    # output before deciding what's left to do.
+    # category columns (and audit columns, under --critics/--models) from the
+    # prior output before deciding what's left to do.
     if restore and output_path.exists() and output_path.resolve() != input_path.resolve():
         prior = pd.read_csv(output_path)
         if len(prior) != len(df):
@@ -141,7 +174,7 @@ def classify_csv(
                 f"but '{input_path}' has {len(df)} rows."
             )
         for cat_name in category_names:
-            generated = {cat_name, *_audit_columns(cat_name)} if critics else {cat_name}
+            generated = {cat_name, *_audit_columns(cat_name, audit_suffixes)}
             for col in generated:
                 if col in prior.columns:
                     df[col] = prior[col]
@@ -152,12 +185,19 @@ def classify_csv(
         completeness_cols = list(category_names)
         if critics:
             completeness_cols += [f"{name}_votes" for name in category_names]
+        elif have_models:
+            # All 3 multi-model audit columns must be non-null, not just one —
+            # a row's answer isn't trustworthy without its full audit trail.
+            completeness_cols += [
+                col for name in category_names for col in _audit_columns(name, audit_suffixes)
+            ]
         already_done = df.loc[work_idx, completeness_cols].notna().all(axis=1)
         work_idx = work_idx[~already_done]
     else:
         reset_cols = list(category_names)
-        if critics:
-            reset_cols += [col for name in category_names for col in _audit_columns(name)]
+        reset_cols += [
+            col for name in category_names for col in _audit_columns(name, audit_suffixes)
+        ]
         # Force object dtype before resetting: a column read back from a prior
         # run's CSV (e.g. a bool-valued `_challenged`/`_reconciled` column with
         # no missing values yet) can be inferred as a non-nullable dtype that
@@ -195,6 +235,17 @@ def classify_csv(
                 ): idx
                 for idx in work_idx
             }
+        elif have_models:
+            future_to_idx = {
+                executor.submit(
+                    multi_model.run_multi_model,
+                    str(df.at[idx, column]),
+                    categories,
+                    models,
+                    allow_new_labels=allow_new_labels,
+                ): idx
+                for idx in work_idx
+            }
         else:
             future_to_idx = {
                 executor.submit(classifier.classify, str(df.at[idx, column])): idx
@@ -207,7 +258,13 @@ def classify_csv(
                 for cat, val in classification.items():
                     df.at[idx, cat] = val
                 classified += 1
-            except Exception:  # noqa: BLE001 - one bad row shouldn't abort the run
+            except Exception:  # noqa: BLE001 - one bad row shouldn't abort the run.
+                # Under --models, multi_model.run_multi_model never raises for
+                # ordinary model failures (even if every model failed), so this
+                # branch is reached only by a genuinely unexpected orchestration
+                # error — most --models rows increment `classified` above
+                # regardless of per-model outcomes. See {category}_model_errors/
+                # model_failure_counts for per-model health, not this counter.
                 failed += 1
             completed += 1
             progress.update(1)
