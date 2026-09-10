@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -120,6 +121,20 @@ def build_parser() -> argparse.ArgumentParser:
         "Roughly multiplies LLM call volume by --sampling-runs per row.",
     )
     parser.add_argument(
+        "--models",
+        nargs="+",
+        metavar="MODEL",
+        help="Enable multi-model voting mode: an alternative to --critics. "
+        "2 or more distinct, space-separated LiteLLM model ids (e.g. "
+        "azure/gpt-5-chat gpt-4o-mini gemini/gemini-2.5-pro), each of which "
+        "classifies the row independently once (no sampling); results are "
+        "merged per category by plurality vote on each model's top label. "
+        "Adds a vote/by-model/error audit trail to the output CSV. Mutually "
+        "exclusive with --critics. Roughly multiplies LLM call volume (and "
+        "concurrent in-flight requests) by the number of models given — size "
+        "--workers down accordingly.",
+    )
+    parser.add_argument(
         "--sampling-runs",
         type=int,
         default=5,
@@ -214,11 +229,39 @@ def main() -> None:
                 f"--sampling-temperature must be >= 0, got {args.sampling_temperature}"
             )
 
+        # --models validation (spec 4, FR-1.1) — all raised before any LLM call,
+        # mirroring the --sampling-temperature checks above.
+        if args.models and args.critics:
+            raise ValueError("--models and --critics are mutually exclusive")
+        if args.models is not None:
+            if len(args.models) < 2:
+                raise ValueError(
+                    f"--models requires at least 2 model ids, got {len(args.models)}"
+                )
+            seen: set[str] = set()
+            duplicates = {m for m in args.models if m in seen or seen.add(m)}
+            if duplicates:
+                raise ValueError(
+                    f"--models values must be unique, got duplicate(s): "
+                    f"{sorted(duplicates)}"
+                )
+            if any(not m.strip() for m in args.models):
+                raise ValueError(f"--models values must be non-empty, got {args.models!r}")
+            if os.getenv("CEREBUS_MODE") == "azure":
+                raise ValueError(
+                    "--models cannot be combined with CEREBUS_MODE=azure: "
+                    "CEREBUS_CONFIG_ID is a single, workspace/model-specific value "
+                    "and cannot be applied to multiple distinct models"
+                )
+
         categories = load_categories(args.categories)
-        # Under --critics, the sampling classifier's schema/prompt must both be
-        # built with the same allow_new_labels value for the constraint to
-        # actually apply (a schema-only or prompt-only fix is incomplete).
-        allow_new_labels = args.allow_new_labels if args.critics else True
+        # Under --critics or --models, the sampling/per-model classifier's
+        # schema/prompt must both be built with the same allow_new_labels value
+        # for the constraint to actually apply (a schema-only or prompt-only fix
+        # is incomplete). --models is a --critics sibling, not a plain-mode
+        # variant, so it shares --critics' carve-out here instead of plain
+        # mode's forced-invention default.
+        allow_new_labels = args.allow_new_labels if (args.critics or args.models) else True
         classification_model = build_classification_model(
             categories, allow_new_labels=allow_new_labels
         )
@@ -264,14 +307,35 @@ def main() -> None:
         def _model_id(raw: str) -> str:
             return cerebus_model_id(raw) if args.cerebus else raw
 
-        classifier = Classifier(
-            model_id=_model_id(args.model),
-            system_prompt=system_prompt,
-            classification_model=classification_model,
-            max_retries=args.retries,
-            temperature=args.sampling_temperature if args.critics else None,
-            **gateway_kwargs,
-        )
+        classifier = None
+        models_classifiers = None
+        if args.models:
+            # --models is a --critics sibling: one Classifier per model id,
+            # sharing the identical system prompt/schema/temperature=None
+            # (each model's own provider default, not --critics' sampling
+            # temperature) and the identical gateway/api config — mirrors the
+            # critic_classifiers/reconciler_classifiers dict-comprehension
+            # pattern below, but keyed by model id instead of category name.
+            models_classifiers = {
+                model_id: Classifier(
+                    model_id=_model_id(model_id),
+                    system_prompt=system_prompt,
+                    classification_model=classification_model,
+                    max_retries=args.retries,
+                    temperature=None,
+                    **gateway_kwargs,
+                )
+                for model_id in args.models
+            }
+        else:
+            classifier = Classifier(
+                model_id=_model_id(args.model),
+                system_prompt=system_prompt,
+                classification_model=classification_model,
+                max_retries=args.retries,
+                temperature=args.sampling_temperature if args.critics else None,
+                **gateway_kwargs,
+            )
 
         critic_classifiers = None
         reconciler_classifiers = None
@@ -320,6 +384,7 @@ def main() -> None:
             sampling_runs=args.sampling_runs,
             consensus_threshold=args.consensus_threshold,
             allow_new_labels=allow_new_labels,
+            models=models_classifiers,
         )
     except (ValueError, FileNotFoundError, RuntimeError) as e:
         print(f"Error: {e}")

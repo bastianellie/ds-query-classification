@@ -16,7 +16,7 @@ import pandas as pd
 import pytest
 
 from query_classification import Category, Classifier, Label, classify_csv
-from query_classification import debate
+from query_classification import debate, multi_model
 from query_classification.prompts import build_critic_prompt, build_reconciler_prompt
 from query_classification.schema import build_critic_model, build_reconciler_model
 
@@ -750,3 +750,313 @@ def test_classify_csv_models_mode_rejects_cross_category_audit_collision():
                 input_csv, "text", None, colliding_categories, output_path=out, models=models
             )
         assert not out.exists()
+
+
+# --- CLI-level: --models mode (spec 4, FR-1.1/FR-1.2) ------------------------
+
+
+def _write_sentiment_categories_json(path):
+    """A minimal, self-contained categories file (mirrors the ``categories``
+    fixture's "sentiment" category) for --models CLI-level tests that need to
+    control exactly which keys a fake ``Classifier.classify`` must return."""
+    payload = {
+        "categories": [
+            {
+                "name": "sentiment",
+                "description": "Overall sentiment.",
+                "labels": [
+                    {"value": "positive", "description": "Happy."},
+                    {"value": "negative", "description": "Sad."},
+                ],
+            }
+        ]
+    }
+    path.write_text(json.dumps(payload))
+
+
+def _neutralize_real_dotenv(monkeypatch, cli):
+    # See test_cli_default_and_overridden_model_routing's comment: main() calls
+    # load_dotenv(override=True), which re-reads this repo's real .env (which
+    # sets DEFAULT_LLM_PROVIDER=cerebus) and would clobber a plain monkeypatch
+    # env value. No-op load_dotenv so only each test's own env applies, and
+    # explicitly clear the two vars these tests care about either way.
+    monkeypatch.setattr(cli, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.delenv("DEFAULT_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("CEREBUS_MODE", raising=False)
+
+
+def test_cli_models_and_critics_mutually_exclusive_exits_before_any_llm_call(
+    monkeypatch, tmp_path, capsys
+):
+    from query_classification import cli
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+
+    def boom(*a, **kw):
+        raise AssertionError("classify_csv should not be reached")
+
+    monkeypatch.setattr(cli, "classify_csv", boom)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--critics",
+            "--models", "a", "b",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+    assert "--models" in capsys.readouterr().out
+
+
+def test_cli_models_fewer_than_two_exits_before_any_llm_call(monkeypatch, tmp_path, capsys):
+    from query_classification import cli
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+
+    def boom(*a, **kw):
+        raise AssertionError("classify_csv should not be reached")
+
+    monkeypatch.setattr(cli, "classify_csv", boom)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--models", "only-one",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+    assert "--models" in capsys.readouterr().out
+
+
+def test_cli_models_duplicate_value_exits_before_any_llm_call(monkeypatch, tmp_path, capsys):
+    from query_classification import cli
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+
+    def boom(*a, **kw):
+        raise AssertionError("classify_csv should not be reached")
+
+    monkeypatch.setattr(cli, "classify_csv", boom)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--models", "a", "a", "b",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+    assert "--models" in capsys.readouterr().out
+
+
+def test_cli_models_empty_value_exits_before_any_llm_call(monkeypatch, tmp_path, capsys):
+    from query_classification import cli
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+
+    def boom(*a, **kw):
+        raise AssertionError("classify_csv should not be reached")
+
+    monkeypatch.setattr(cli, "classify_csv", boom)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--models", "a", "   ",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+    assert "--models" in capsys.readouterr().out
+
+
+def test_cli_models_with_cerebus_azure_mode_exits_before_any_llm_call(
+    monkeypatch, tmp_path, capsys
+):
+    from query_classification import cli
+
+    _neutralize_real_dotenv(monkeypatch, cli)
+    monkeypatch.setenv("CEREBUS_MODE", "azure")
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+
+    def boom(*a, **kw):
+        raise AssertionError("classify_csv should not be reached")
+
+    monkeypatch.setattr(cli, "classify_csv", boom)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--models", "a", "b",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+    assert "--models" in capsys.readouterr().out
+
+
+def test_cli_models_mode_end_to_end_writes_audit_columns(monkeypatch, tmp_path):
+    from query_classification import cli
+
+    _neutralize_real_dotenv(monkeypatch, cli)
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello", "world"]}).to_csv(input_csv, index=False)
+    categories_file = tmp_path / "categories.json"
+    _write_sentiment_categories_json(categories_file)
+    out = tmp_path / "out.csv"
+
+    def fake_classify(self, text):
+        return {"sentiment": ["positive"]}
+
+    monkeypatch.setattr(Classifier, "classify", fake_classify)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--output", str(out),
+            "--categories", str(categories_file),
+            "--models", "model-a", "model-b",
+        ],
+    )
+    cli.main()
+
+    cols = list(pd.read_csv(out).columns)
+    for suffix in multi_model.AUDIT_COLUMN_SUFFIXES:
+        assert f"sentiment{suffix}" in cols
+    assert "sentiment" in cols
+
+
+def test_cli_models_mode_honors_allow_new_labels_carve_out(monkeypatch, tmp_path):
+    """Spec 4 FR-1.2's carve-out: unlike plain mode (which forces
+    allow_new_labels=True regardless of the flag), --models mode -- a
+    --critics sibling, not a plain-mode variant -- must honor
+    --allow-new-labels exactly like --critics does."""
+    from query_classification import cli
+
+    _neutralize_real_dotenv(monkeypatch, cli)
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+
+    def _system_prompts_for(extra_args):
+        constructed = []
+        original_classifier = Classifier
+
+        class RecordingClassifier(original_classifier):
+            def __init__(self, *args, **kwargs):
+                constructed.append(kwargs)
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(cli, "Classifier", RecordingClassifier)
+        monkeypatch.setattr(cli, "classify_csv", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "classify.py",
+                "--input", str(input_csv),
+                "--column", "text",
+                "--output", str(tmp_path / "out.csv"),
+                "--models", "a", "b",
+                *extra_args,
+            ],
+        )
+        cli.main()
+        assert len(constructed) == 2
+        prompts = {kw["system_prompt"] for kw in constructed}
+        assert len(prompts) == 1  # identical prompt shared by every model
+        return prompts.pop()
+
+    forbidden_prompt = _system_prompts_for([])
+    assert "Do not invent a new label." in forbidden_prompt
+
+    allowed_prompt = _system_prompts_for(["--allow-new-labels"])
+    assert "Do not invent a new label." not in allowed_prompt
+
+
+def test_cli_models_mode_cerebus_routes_all_models_through_same_gateway_config(
+    monkeypatch, tmp_path
+):
+    from query_classification import cli
+
+    _neutralize_real_dotenv(monkeypatch, cli)
+
+    fake_gateway = {
+        "api_base": "https://gw.example.test/v1",
+        "api_key": "fake-cerebus-key",
+        "extra_headers": {
+            "x-portkey-api-key": "fake-cerebus-key",
+            "x-portkey-provider": "openai",
+        },
+    }
+    monkeypatch.setattr(cli, "build_cerebus_completion_kwargs", lambda: fake_gateway)
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+
+    constructed = []
+    original_classifier = Classifier
+
+    class RecordingClassifier(original_classifier):
+        def __init__(self, *args, **kwargs):
+            constructed.append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "Classifier", RecordingClassifier)
+    monkeypatch.setattr(cli, "classify_csv", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--output", str(tmp_path / "out.csv"),
+            "--cerebus",
+            "--models", "a", "b",
+        ],
+    )
+    cli.main()
+
+    assert len(constructed) == 2
+    model_ids = {kw["model_id"] for kw in constructed}
+    # _model_id() applies cerebus_model_id()'s "openai/" prefix to every
+    # --models entry, exactly as it already does for --critic-model/
+    # --reconciler-model.
+    assert model_ids == {"openai/a", "openai/b"}
+    for kw in constructed:
+        assert kw["api_base"] == fake_gateway["api_base"]
+        assert kw["api_key"] == fake_gateway["api_key"]
+        assert kw["extra_headers"] == fake_gateway["extra_headers"]
