@@ -1,5 +1,9 @@
 # Spec 4: Multi-Model Voting Classification
 
+> **Status: CLOSED** — Implemented and verified on 2026-09-10.
+> Implementation summary: `spec/4-multi-model-classification/implementation-summary.md`
+> Merged from worktree branch `spec/4-multi-model-classification` on 2026-09-10.
+
 ## Overview
 
 Adds a new `--models` classification mode to `classify.py` (`cli.py`) and `experiment.py`'s
