@@ -35,7 +35,7 @@ import litellm
 import pandas as pd
 from dotenv import load_dotenv
 
-from query_classification import debate
+from query_classification import debate, multi_model
 from query_classification.categories import Category, Label, load_categories
 from query_classification.classifier import (
     Classifier,
@@ -82,7 +82,7 @@ _ARTIFACT_FILENAMES = (
 _RESERVED_SENTINEL_PREFIX = "none - "
 _RESERVED_SENTINEL = "none"
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +219,15 @@ def build_parser() -> argparse.ArgumentParser:
     classification.add_argument("--critic-model", metavar="MODEL")
     classification.add_argument("--reconciler-model", metavar="MODEL")
     classification.add_argument(
+        "--models",
+        nargs="+",
+        metavar="MODEL",
+        help="Enable multi-model voting: 2+ distinct LiteLLM model ids that each "
+        "classify a row once, independently (temperature unset, no sampling), merged "
+        "per category by plurality vote. A standalone alternative to --critics — "
+        "mutually exclusive with it, and incompatible with CEREBUS_MODE=azure.",
+    )
+    classification.add_argument(
         "--allow-partial",
         action="store_true",
         help="Exit zero even if some rows failed to classify (still recorded in run_config.json)",
@@ -314,6 +323,22 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 f"--consensus-threshold must be between 1 and --sampling-runs "
                 f"({args.sampling_runs}) inclusive, got {args.consensus_threshold}"
+            )
+
+    if getattr(args, "models", None):
+        if getattr(args, "critics", False):
+            raise ValueError("--models and --critics are mutually exclusive")
+        if len(args.models) < 2:
+            raise ValueError(f"--models requires at least 2 values, got {len(args.models)}")
+        if len(set(args.models)) != len(args.models):
+            raise ValueError(f"--models values must be unique, got {args.models}")
+        if any(not m.strip() for m in args.models):
+            raise ValueError("--models values must not be empty/whitespace-only")
+        if os.getenv("CEREBUS_MODE") == "azure":
+            raise ValueError(
+                "--models is incompatible with CEREBUS_MODE=azure: CEREBUS_CONFIG_ID is "
+                "a single, workspace/model-specific value and cannot apply to N distinct "
+                "models"
             )
 
 
@@ -451,18 +476,25 @@ def _construct_classifiers(
     will_induce: bool,
     will_classify: bool,
     gateway_kwargs: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], dict[str, str | None]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Construct every classifier role this invocation needs. Returns
     (classifiers, resolved_model_ids). ``gateway_kwargs`` should be resolved
     once per invocation via `_resolve_gateway_kwargs` and passed in by the
     caller; if omitted (e.g. direct unit testing of this function), it's
-    resolved locally instead."""
+    resolved locally instead.
+
+    ``classification_models``/``model_failure_counts`` are always present in
+    the returned ``models`` dict (``None`` unless ``--models`` is in use) —
+    every invocation, not only ``--models`` ones — so ``run_config.json``'s
+    ``models`` field always has a single, consistent shape (FR-1.9)."""
     classifiers: dict[str, Any] = {}
-    models: dict[str, str | None] = {
+    models: dict[str, Any] = {
         "model": args.model,
         "induction_model": None,
         "critic_model": None,
         "reconciler_model": None,
+        "classification_models": None,
+        "model_failure_counts": None,
     }
 
     use_cerebus = getattr(args, "cerebus", False)
@@ -496,38 +528,57 @@ def _construct_classifiers(
             extra_prompt=extra_prompt,
             allow_new_labels=allow_new_labels,
         )
-        classifiers["classification"] = Classifier(
-            model_id=_model_id(args.model),
-            system_prompt=system_prompt,
-            classification_model=classification_model,
-            max_retries=args.retries,
-            temperature=args.sampling_temperature if args.critics else None,
-            **gateway_kwargs,
-        )
+        if getattr(args, "models", None):
+            # --models mode: N distinct models, each classifying independently
+            # at provider-default temperature (never --critics'
+            # --sampling-temperature) — no single classification-role model
+            # id, so "model" becomes null and "classification_models" records
+            # the ordered list instead (FR-1.9, AR-1.7).
+            classifiers["multi_model"] = {
+                m: Classifier(
+                    model_id=_model_id(m),
+                    system_prompt=system_prompt,
+                    classification_model=classification_model,
+                    max_retries=args.retries,
+                    **gateway_kwargs,
+                )
+                for m in args.models
+            }
+            models["model"] = None
+            models["classification_models"] = list(args.models)
+        else:
+            classifiers["classification"] = Classifier(
+                model_id=_model_id(args.model),
+                system_prompt=system_prompt,
+                classification_model=classification_model,
+                max_retries=args.retries,
+                temperature=args.sampling_temperature if args.critics else None,
+                **gateway_kwargs,
+            )
 
-        if args.critics:
-            models["critic_model"] = args.critic_model or args.model
-            models["reconciler_model"] = args.reconciler_model or args.model
-            critic_classifiers = {}
-            reconciler_classifiers = {}
-            for cat in categories:
-                label_options = "; ".join(f'"{lbl.value}": {lbl.description}' for lbl in cat.labels)
-                critic_classifiers[cat.name] = Classifier(
-                    model_id=_model_id(models["critic_model"]),
-                    system_prompt=build_critic_prompt(cat.name, cat.description, label_options),
-                    classification_model=build_critic_model(cat),
-                    max_retries=args.retries,
-                    **gateway_kwargs,
-                )
-                reconciler_classifiers[cat.name] = Classifier(
-                    model_id=_model_id(models["reconciler_model"]),
-                    system_prompt=build_reconciler_prompt(cat.name, cat.description, label_options),
-                    classification_model=build_reconciler_model(cat),
-                    max_retries=args.retries,
-                    **gateway_kwargs,
-                )
-            classifiers["critics"] = critic_classifiers
-            classifiers["reconcilers"] = reconciler_classifiers
+            if args.critics:
+                models["critic_model"] = args.critic_model or args.model
+                models["reconciler_model"] = args.reconciler_model or args.model
+                critic_classifiers = {}
+                reconciler_classifiers = {}
+                for cat in categories:
+                    label_options = "; ".join(f'"{lbl.value}": {lbl.description}' for lbl in cat.labels)
+                    critic_classifiers[cat.name] = Classifier(
+                        model_id=_model_id(models["critic_model"]),
+                        system_prompt=build_critic_prompt(cat.name, cat.description, label_options),
+                        classification_model=build_critic_model(cat),
+                        max_retries=args.retries,
+                        **gateway_kwargs,
+                    )
+                    reconciler_classifiers[cat.name] = Classifier(
+                        model_id=_model_id(models["reconciler_model"]),
+                        system_prompt=build_reconciler_prompt(cat.name, cat.description, label_options),
+                        classification_model=build_reconciler_model(cat),
+                        max_retries=args.retries,
+                        **gateway_kwargs,
+                    )
+                classifiers["critics"] = critic_classifiers
+                classifiers["reconcilers"] = reconciler_classifiers
 
     return classifiers, models
 
@@ -777,7 +828,14 @@ def main() -> None:
             categories = None
             label_values = None
             categories_source = "supplied"
-            models_final = {"model": args.model, "induction_model": None, "critic_model": None, "reconciler_model": None}
+            models_final = {
+                "model": args.model,
+                "induction_model": None,
+                "critic_model": None,
+                "reconciler_model": None,
+                "classification_models": None,
+                "model_failure_counts": None,
+            }
 
         if will_classify:
             stage = "classifying"
@@ -828,6 +886,8 @@ def main() -> None:
             generated = {category_name}
             if args.critics:
                 generated |= {f"{category_name}{suffix}" for suffix in debate.AUDIT_COLUMN_SUFFIXES}
+            elif args.models:
+                generated |= {f"{category_name}{suffix}" for suffix in multi_model.AUDIT_COLUMN_SUFFIXES}
             collide = generated & (test_source_cols - ({args.label_column} if args.label_column else set()))
             if collide:
                 raise ValueError(
@@ -845,15 +905,26 @@ def main() -> None:
                 args, categories, will_induce=False, will_classify=True, gateway_kwargs=gateway_kwargs
             )
             if will_induce:
+                # The induction-only _construct_classifiers call above never
+                # sets these (they're classification-role fields) — carry
+                # them across from this second, classification-role call the
+                # same way critic_model/reconciler_model already are, so a
+                # `run` invocation that both induces and uses --models
+                # doesn't silently keep the induction call's stale "model"
+                # value or drop classification_models/model_failure_counts
+                # entirely (FR-1.9).
+                models_final["model"] = models.get("model")
                 models_final["critic_model"] = models.get("critic_model")
                 models_final["reconciler_model"] = models.get("reconciler_model")
+                models_final["classification_models"] = models.get("classification_models")
+                models_final["model_failure_counts"] = models.get("model_failure_counts")
             else:
                 models_final = models
 
             classified_path = classify_csv(
                 input_path=test_csv_path,
                 column=args.text_column,
-                classifier=classifiers["classification"],
+                classifier=classifiers.get("classification"),
                 categories=categories,
                 output_path=run_dir / "test_classified.csv",
                 limit=None,
@@ -864,6 +935,7 @@ def main() -> None:
                 sampling_runs=args.sampling_runs,
                 consensus_threshold=args.consensus_threshold,
                 allow_new_labels=args.allow_new_labels,
+                models=classifiers.get("multi_model"),
             )
 
             stage = "verifying"
@@ -872,6 +944,12 @@ def main() -> None:
             check_cols = [category_name]
             if args.critics:
                 check_cols.append(f"{category_name}_votes")
+            elif args.models:
+                check_cols += [
+                    f"{category_name}_votes",
+                    f"{category_name}_by_model",
+                    f"{category_name}_model_errors",
+                ]
             incomplete_mask = result_df[check_cols].isna().any(axis=1)
             unclassified_positions = result_df.index[incomplete_mask].tolist()
             config["unclassified_rows"] = {
@@ -879,6 +957,24 @@ def main() -> None:
                 "positions": unclassified_positions,
             }
             status = "completed_with_failures" if unclassified_positions else "completed"
+
+            if args.models:
+                # Every model starts at 0 so a model that never failed still
+                # shows an explicit zero-count entry, not an omitted key.
+                # Only one category exists per experiment run, so this is a
+                # single-column read, not a loop over categories.
+                model_failure_counts = {m: 0 for m in args.models}
+                errors_col = f"{category_name}_model_errors"
+                for raw in result_df[errors_col]:
+                    if pd.isna(raw):
+                        continue
+                    for model_id in json.loads(raw):
+                        if model_id in model_failure_counts:
+                            model_failure_counts[model_id] += 1
+                # Written into models_final (the same local variable that
+                # eventually becomes config["models"] below) — config["models"]
+                # itself does not exist yet at this point.
+                models_final["model_failure_counts"] = model_failure_counts
         else:
             config["unclassified_rows"] = None
             config["test_labels"] = None

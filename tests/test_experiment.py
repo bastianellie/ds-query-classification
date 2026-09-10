@@ -1019,6 +1019,201 @@ def test_failed_run_writes_status_failed(tmp_path):
     assert "failure" in config
 
 
+# ---------------------------------------------------------------------------
+# experiment.py — --models (multi-model voting) mode [spec 4]
+# ---------------------------------------------------------------------------
+
+
+def test_models_and_critics_mutually_exclusive(tmp_path, fake_classify):
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(tmp_path / "r"), "--models", "a", "b", "--critics"]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+def test_models_requires_at_least_two_values(tmp_path, fake_classify):
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(tmp_path / "r"), "--models", "a"]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+def test_models_rejects_duplicate_value(tmp_path, fake_classify):
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(tmp_path / "r"), "--models", "a", "a", "b"]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+def test_models_rejects_empty_value(tmp_path, fake_classify):
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(tmp_path / "r"), "--models", "a", ""]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+def test_models_rejects_cerebus_azure_mode(tmp_path, fake_classify, monkeypatch):
+    monkeypatch.setenv("CEREBUS_MODE", "azure")
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(tmp_path / "r"), "--models", "a", "b"]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+def test_induce_help_does_not_list_models(capsys):
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["induce", "--help"])
+    assert "--models" not in capsys.readouterr().out
+
+
+def test_models_end_to_end_run_config(tmp_path, fake_classify):
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "r"
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(run_dir), "--models", "a", "b"]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["schema_version"] == 2
+    assert config["models"]["classification_models"] == ["a", "b"]
+    assert config["models"]["model"] is None
+    assert set(config["models"]["model_failure_counts"].keys()) == {"a", "b"}
+    df = pd.read_csv(run_dir / "test_classified.csv")
+    for suffix in ("_votes", "_by_model", "_model_errors"):
+        assert f"sentiment{suffix}" in df.columns
+
+
+def test_models_non_models_run_has_null_keys(tmp_path, fake_classify):
+    # A plain (non --models) run must still show classification_models and
+    # model_failure_counts as present-but-null, never omitted.
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "r"
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(run_dir)]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    models_cfg = config["models"]
+    assert "classification_models" in models_cfg and models_cfg["classification_models"] is None
+    assert "model_failure_counts" in models_cfg and models_cfg["model_failure_counts"] is None
+    assert models_cfg["model"] is not None
+
+
+def test_models_run_with_induction_merges_all_fields(tmp_path, fake_classify):
+    # A `run` invocation that both induces AND uses --models must not
+    # silently keep the induction call's --model value in models_final
+    # ("model" must become null), and classification_models/
+    # model_failure_counts must be carried across from the classification-
+    # role _construct_classifiers call, not dropped.
+    train = _write_csv(
+        tmp_path / "train.csv",
+        [("great product", "positive"), ("bad product", "negative")] * 3,
+        ["text", "label"],
+    )
+    test = _write_csv(
+        tmp_path / "test.csv",
+        [("fantastic", "positive"), ("awful", "negative")],
+        ["text", "label"],
+    )
+    run_dir = tmp_path / "run_models"
+    code = _run_main(
+        ["run", "--train-file", str(train), "--test-file", str(test),
+         "--text-column", "text", "--label-column", "label",
+         "--category-name", "sentiment", "--run-dir", str(run_dir),
+         "--model", "induction-model-id", "--models", "a", "b"]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["models"]["model"] is None
+    assert config["models"]["classification_models"] == ["a", "b"]
+    assert "model_failure_counts" in config["models"]
+
+
+def test_models_source_column_collision(tmp_path, fake_classify):
+    (tmp_path / "test.csv").write_text("text,label,sentiment_by_model\nhi,positive,bogus\n")
+    cats_path = _write_categories(tmp_path / "cats.json", name="sentiment")
+    code = _run_main(
+        ["classify", "--test-file", str(tmp_path / "test.csv"), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path), "--run-dir", str(tmp_path / "r"),
+         "--models", "a", "b"]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+@pytest.mark.parametrize("suffix", ["_votes", "_by_model", "_model_errors"])
+def test_models_source_column_collision_all_suffixes(tmp_path, fake_classify, suffix):
+    (tmp_path / "test.csv").write_text(f"text,label,sentiment{suffix}\nhi,positive,bogus\n")
+    cats_path = _write_categories(tmp_path / "cats.json", name="sentiment")
+    code = _run_main(
+        ["classify", "--test-file", str(tmp_path / "test.csv"), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path), "--run-dir", str(tmp_path / "r"),
+         "--models", "a", "b"]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+def test_models_failure_counts_per_model(tmp_path, monkeypatch):
+    # Force direct-provider mode regardless of the local .env's
+    # DEFAULT_LLM_PROVIDER setting, so self.model_id is exactly the raw
+    # --models value ("bad"/"good"), not a Cerebus-prefixed variant
+    # (cerebus_model_id would turn "bad" into "openai/bad").
+    monkeypatch.setattr("query_classification.experiment.cerebus_enabled_via_env", lambda: False)
+
+    def _classify(self, text):
+        if self.model_id == "bad":
+            raise RuntimeError("boom")
+        return {"sentiment": ["positive"]}
+
+    monkeypatch.setattr(Classifier, "classify", _classify)
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "r"
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(run_dir), "--models", "bad", "good"]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    counts = config["models"]["model_failure_counts"]
+    assert counts["bad"] > 0
+    assert counts["good"] == 0  # explicit zero entry, not an omitted key
+
+
 def test_module_invocation_help():
     import subprocess
 
