@@ -73,6 +73,39 @@ model`/`--reconciler-model` can each point at a different LiteLLM model than
 model resolves to; make sure that's intentional before pointing them at a
 different provider than your main classification calls.
 
+### Multi-model mode: N distinct models, merged by plurality vote
+
+`--models` is a standalone alternative to `--critics` (mutually exclusive with
+it): 2 or more distinct LiteLLM model ids each classify a row once,
+independently — no sampling, no Critic/Reconciler debate — and the results are
+merged per category by plurality vote on each model's top label. Ties are
+broken in favor of whichever tied label the earliest-listed model picked. Adds
+a per-model/vote-tally/failure audit trail to the output CSV:
+
+```bash
+python classify.py \
+  --input data/queries.csv \
+  --column text \
+  --output output/queries_classified.csv \
+  --categories resources/categories/example_support_tickets.json \
+  --models azure/gpt-5-chat gpt-4o-mini gemini/gemini-2.5-pro
+```
+
+This multiplies per-row LLM call volume by the number of models given (before
+any internal retries/JSON-mode fallback), and concurrent in-flight requests
+are roughly `--workers × <number of models>` — size `--workers` down
+accordingly for large inputs, same as `--critics`. Each model in `--models`
+gets the identical system prompt/schema/`--allow-new-labels` setting and its
+own provider default temperature (not `--critics`' `--sampling-temperature`).
+As with `--critic-model`/`--reconciler-model`, the same row text is sent to
+every provider each listed model resolves to — this is a bigger data-egress
+surface than a single `--model`, since it's N providers instead of one; make
+sure that's intentional for sensitive input before pointing `--models` at
+providers outside your usual one. `--models` cannot be combined with
+`CEREBUS_MODE=azure` (`CEREBUS_CONFIG_ID` is a single, workspace/model-specific
+value that can't apply to several distinct models); it works normally with
+Cerebus direct mode or with direct providers.
+
 ### Reproducing the original decision-classification setup
 
 ```bash
@@ -108,6 +141,7 @@ python classify.py \
 | `--allow-new-labels` | Under `--critics`, allow suggesting `"none - <new label>"` instead of only predefined labels/`"none"`. |
 | `--critic-model` | LiteLLM model id for the `--critics` Critic role (default: `--model`). |
 | `--reconciler-model` | LiteLLM model id for the `--critics` Reconciler role (default: `--model`). |
+| `--models` | 2+ distinct model ids for multi-model voting mode (see above); mutually exclusive with `--critics`. |
 | `--cerebus` | Route every LLM call through the Cerebus/Portkey gateway instead of a direct provider (see below). |
 
 ## Cerebus / Portkey gateway
@@ -176,14 +210,17 @@ python experiment.py run \
 
 Equivalent to `python -m query_classification.experiment ...`. All of
 `classify.py`'s classifier-configuration flags are available on
-`classify`/`run` (`--model`, `--critics`, `--sampling-runs`, ...); `induce`/
-`run` additionally take `--seed`, `--examples-per-label`,
-`--max-example-chars`, `--max-prompt-chars`, and `--induction-model`.
-`--cerebus` is available on all three subcommands (it applies to the
-induction call too). One exception: `classify.py`'s `--limit` is called
-`--test-limit` here, to make clear it only bounds the test split being
-classified (not the train split used for induction); omitting it classifies
-the entire test split.
+`classify`/`run` (`--model`, `--critics`, `--models`, `--sampling-runs`, ...) —
+not `induce`, which has no classification role; `induce`/`run` additionally
+take `--seed`, `--examples-per-label`, `--max-example-chars`,
+`--max-prompt-chars`, and `--induction-model`. `--cerebus` is available on all
+three subcommands (it applies to the induction call too). One exception:
+`classify.py`'s `--limit` is called `--test-limit` here, to make clear it only
+bounds the test split being classified (not the train split used for
+induction); omitting it classifies the entire test split. `--restore` has no
+equivalent here at all — every `experiment.py` invocation classifies its test
+split fresh (this only matters for `classify.py`'s own `--restore`, not
+`experiment.py`).
 
 For a HuggingFace dataset instead of local files, install the optional
 `hf` extra (`pip install '.[hf]'`, requires `datasets>=4`) and pass
@@ -214,12 +251,19 @@ actually match a prediction.
 **Data egress note:** the `induce` subcommand sends sampled **train** text to
 whichever model `--induction-model` (or `--model`) resolves to; `classify`/
 `run` send **test** text to `--model` (and, under `--critics`, to
-`--critic-model`/`--reconciler-model` too). Point any of these at a different
+`--critic-model`/`--reconciler-model` too; under `--models`, to every one of
+the 2+ listed models — a bigger egress surface than any single-model mode,
+since it's N providers instead of one). Point any of these at a different
 provider than your default only if you intend that split's text to go there.
-As with `classify.py`, output CSV cells are not sanitized against
+As with `classify.py`, output CSV cells (including `--models`' new
+`_votes`/`_by_model`/`_model_errors` audit columns) are not sanitized against
 spreadsheet-formula injection if opened in a spreadsheet application — treat
 `test_classified.csv` as you would any other untrusted CSV before opening it
 that way.
+
+**Analysis notebook compatibility:** `experiments/ag-news/analyze_run.ipynb`
+reads `--critics`-specific columns (`_initial`/`_votes`/`_challenged`/
+`_reconciled`) and cannot analyze a `--models` run's output as-is.
 
 ## Defining categories
 
@@ -252,6 +296,7 @@ src/query_classification/
   classifier.py   # single-text LLM classification (Classifier)
   pipeline.py     # CSV batch loop (restore / limit / incremental save)
   debate.py       # --critics: sampling, consensus voting, Critic/Reconciler debate
+  multi_model.py  # --models: N-model plurality-vote classification/audit trail
   cli.py          # argparse entry point (classify.py)
   dataset_io.py   # local/HF dataset loading, label normalization, row filtering
   induction.py    # category induction: sampling, one LLM call, reconciliation
