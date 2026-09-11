@@ -28,6 +28,7 @@ import platform
 import shutil
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +83,7 @@ _ARTIFACT_FILENAMES = (
 _RESERVED_SENTINEL_PREFIX = "none - "
 _RESERVED_SENTINEL = "none"
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +139,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument(
         "--model",
-        default="azure/gpt-5-chat",
-        help="Base LiteLLM model id; every role below defaults to this",
+        nargs="+",
+        default=None,
+        metavar="MODEL",
+        help="Base LiteLLM model id (default: azure/gpt-5-chat); every role below "
+        "defaults to this. Accepts exactly one value — under classify/run, use "
+        "--models for multiple, or --n-classifiers to replicate this one model "
+        "into several independent classifier instances.",
     )
     common.add_argument(
         "--cerebus",
@@ -222,10 +228,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--models",
         nargs="+",
         metavar="MODEL",
-        help="Enable multi-model voting: 2+ distinct LiteLLM model ids that each "
-        "classify a row once, independently (temperature unset, no sampling), merged "
-        "per category by plurality vote. A standalone alternative to --critics — "
-        "mutually exclusive with it, and incompatible with CEREBUS_MODE=azure.",
+        help="Enable multi-classifier voting mode: an alternative to --critics. 2 "
+        "or more space-separated LiteLLM model ids -- duplicates allowed, e.g. the "
+        "same model repeated for a plurality vote of several independent samples; "
+        "a single value is equivalent to --model. Each classifies the row "
+        "independently once (no sampling); results are merged per category by "
+        "plurality vote. Mutually exclusive with --critics when given 2+ values, "
+        "and incompatible with CEREBUS_MODE=azure when 2+ distinct models resolve.",
+    )
+    classification.add_argument(
+        "--n-classifiers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of classifier instances to construct (default: 1). Only "
+        "meaningful when replicating a single resolved model (--model, or "
+        "--models with exactly one value) — has no effect when --models is "
+        "given with 2+ values, where the classifier count is simply "
+        "len(--models).",
     )
     classification.add_argument(
         "--allow-partial",
@@ -259,6 +279,110 @@ def _log_phase(phase: str) -> None:
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
+
+_DEFAULT_MODEL = "azure/gpt-5-chat"
+
+
+def _resolve_single_default_model(args: argparse.Namespace) -> str:
+    """Return args.model[0] if --model was given, else the literal default --
+    used for --induction-model's fallback and as the literal default in the
+    single-resolved-model branch of `_resolve_classifier_models`. Per spec 4
+    AR-1.8's 4th case, this is also what induction falls back to even when
+    --models has 2+ values for the classification role in the same
+    invocation — never one of --models' entries."""
+    if args.model is not None:
+        return args.model[0]
+    return _DEFAULT_MODEL
+
+
+def _resolve_classifier_models(args: argparse.Namespace) -> list[str]:
+    """Resolve --model/--models/--n-classifiers into the final, ordered list
+    of model ids to construct one classifier instance per (spec 4 FR-1.1).
+    Duplicated from cli.py's identical helper per this project's established
+    small-duplication convention (see module docstring) — with this module's
+    own wrinkle: --models/--n-classifiers don't exist as `args` attributes
+    for `induce` (only --model lives in the `common` group), so every check
+    but the first is gated behind `hasattr(args, "models")`.
+
+    A resolved list of length 1 is today's existing plain/--critics-classifier
+    behavior, unchanged; length 2+ engages multi-classifier voting mode.
+    """
+    if args.model is not None and len(args.model) > 1:
+        raise ValueError(
+            f"--model only accepts a single model id, got {len(args.model)}: "
+            f"{args.model!r}. Use --models for multiple models."
+        )
+
+    if not hasattr(args, "models"):
+        return [_resolve_single_default_model(args)]
+
+    n_classifiers = getattr(args, "n_classifiers", 1)
+    if n_classifiers < 1:
+        raise ValueError(f"--n-classifiers must be >= 1, got {n_classifiers}")
+
+    models_multi = args.models is not None and len(args.models) > 1
+
+    if args.model is not None and args.models is not None and len(args.models) != 1:
+        raise ValueError(
+            "--model and --models cannot both be given, unless --models has "
+            "exactly one value (which silently overrides --model)"
+        )
+
+    if models_multi:
+        if getattr(args, "critics", False):
+            raise ValueError("--models with 2+ values and --critics are mutually exclusive")
+        if any(not m.strip() for m in args.models):
+            raise ValueError(f"--models values must be non-empty, got {args.models!r}")
+        resolved = list(args.models)
+    else:
+        if args.models is not None:
+            single = args.models[0]  # single-value --models overrides --model
+        else:
+            single = _resolve_single_default_model(args)
+        if not single.strip():
+            raise ValueError("model id must not be empty/whitespace-only")
+        if n_classifiers > 1 and getattr(args, "critics", False):
+            raise ValueError("--n-classifiers > 1 and --critics are mutually exclusive")
+        resolved = [single] * n_classifiers
+
+    if len(set(resolved)) > 1 and os.getenv("CEREBUS_MODE") == "azure":
+        raise ValueError(
+            "--models/--n-classifiers with 2+ distinct models cannot be combined "
+            "with CEREBUS_MODE=azure: CEREBUS_CONFIG_ID is a single, "
+            "workspace/model-specific value and cannot be applied to multiple "
+            "distinct models"
+        )
+    return resolved
+
+
+def _build_classifier_dict(resolved_models: list[str], build_one) -> dict[str, Any]:
+    """Build {key: Classifier} for a resolved multi-classifier list (spec 4
+    AR-1.3): keyed by bare model id, unless that id occurs more than once in
+    ``resolved_models``, in which case every occurrence gets an
+    occurrence-suffixed key ("<id>#N", 1-indexed by position) so repeated
+    models remain individually addressable in the audit trail. ``build_one``
+    constructs a Classifier from a raw model id. Duplicated from cli.py's
+    identical helper per this project's established small-duplication
+    convention."""
+    counts = Counter(resolved_models)
+    seen: dict[str, int] = {}
+    result: dict[str, Any] = {}
+    for m in resolved_models:
+        if counts[m] > 1:
+            seen[m] = seen.get(m, 0) + 1
+            key = f"{m}#{seen[m]}"
+        else:
+            key = m
+        if key in result:
+            raise ValueError(
+                f"Model id collision building classifier keys: '{key}' would be "
+                f"assigned to two different classifier instances. This can happen "
+                f"if a supplied model id already looks like '<other-id>#N'. Rename "
+                f"the conflicting model id."
+            )
+        result[key] = build_one(m)
+    return result
 
 
 def _check_reserved_sentinel(label_values: list[str]) -> None:
@@ -325,21 +449,10 @@ def _validate_args(args: argparse.Namespace) -> None:
                 f"({args.sampling_runs}) inclusive, got {args.consensus_threshold}"
             )
 
-    if getattr(args, "models", None):
-        if getattr(args, "critics", False):
-            raise ValueError("--models and --critics are mutually exclusive")
-        if len(args.models) < 2:
-            raise ValueError(f"--models requires at least 2 values, got {len(args.models)}")
-        if len(set(args.models)) != len(args.models):
-            raise ValueError(f"--models values must be unique, got {args.models}")
-        if any(not m.strip() for m in args.models):
-            raise ValueError("--models values must not be empty/whitespace-only")
-        if os.getenv("CEREBUS_MODE") == "azure":
-            raise ValueError(
-                "--models is incompatible with CEREBUS_MODE=azure: CEREBUS_CONFIG_ID is "
-                "a single, workspace/model-specific value and cannot apply to N distinct "
-                "models"
-            )
+    # --model/--models/--n-classifiers resolution (spec 4, FR-1.1) — raised
+    # before any LLM call. Stored on args so _construct_classifiers reuses the
+    # exact same resolved list rather than recomputing it a second time.
+    args.resolved_classifier_models = _resolve_classifier_models(args)
 
 
 def _resolve_mode(args: argparse.Namespace) -> tuple[bool, bool]:
@@ -484,12 +597,17 @@ def _construct_classifiers(
     resolved locally instead.
 
     ``classification_models``/``model_failure_counts`` are always present in
-    the returned ``models`` dict (``None`` unless ``--models`` is in use) —
-    every invocation, not only ``--models`` ones — so ``run_config.json``'s
-    ``models`` field always has a single, consistent shape (FR-1.9)."""
+    the returned ``models`` dict (``None`` unless the resolved classifier list
+    has length 2+) — every invocation, not only multi-classifier ones — so
+    ``run_config.json``'s ``models`` field always has a single, consistent
+    shape (FR-1.9)."""
+    resolved_models = getattr(args, "resolved_classifier_models", None)
+    if resolved_models is None:
+        resolved_models = _resolve_classifier_models(args)
+
     classifiers: dict[str, Any] = {}
     models: dict[str, Any] = {
-        "model": args.model,
+        "model": resolved_models[0] if len(resolved_models) == 1 else None,
         "induction_model": None,
         "critic_model": None,
         "reconciler_model": None,
@@ -505,7 +623,9 @@ def _construct_classifiers(
         return cerebus_model_id(raw) if use_cerebus else raw
 
     if will_induce:
-        models["induction_model"] = getattr(args, "induction_model", None) or args.model
+        models["induction_model"] = (
+            getattr(args, "induction_model", None) or _resolve_single_default_model(args)
+        )
         classifiers["induction"] = Classifier(
             model_id=_model_id(models["induction_model"]),
             system_prompt=build_induction_prompt(),
@@ -528,27 +648,28 @@ def _construct_classifiers(
             extra_prompt=extra_prompt,
             allow_new_labels=allow_new_labels,
         )
-        if getattr(args, "models", None):
-            # --models mode: N distinct models, each classifying independently
-            # at provider-default temperature (never --critics'
-            # --sampling-temperature) — no single classification-role model
-            # id, so "model" becomes null and "classification_models" records
-            # the ordered list instead (FR-1.9, AR-1.7).
-            classifiers["multi_model"] = {
-                m: Classifier(
+        if len(resolved_models) > 1:
+            # Multi-classifier mode: 2+ resolved classifier instances, each
+            # classifying independently at provider-default temperature
+            # (never --critics' --sampling-temperature) — no single
+            # classification-role model id, so "model" becomes null and
+            # "classification_models" records the ordered list instead
+            # (FR-1.9, AR-1.7).
+            classifiers["multi_model"] = _build_classifier_dict(
+                resolved_models,
+                lambda m: Classifier(
                     model_id=_model_id(m),
                     system_prompt=system_prompt,
                     classification_model=classification_model,
                     max_retries=args.retries,
                     **gateway_kwargs,
-                )
-                for m in args.models
-            }
+                ),
+            )
             models["model"] = None
-            models["classification_models"] = list(args.models)
+            models["classification_models"] = list(resolved_models)
         else:
             classifiers["classification"] = Classifier(
-                model_id=_model_id(args.model),
+                model_id=_model_id(resolved_models[0]),
                 system_prompt=system_prompt,
                 classification_model=classification_model,
                 max_retries=args.retries,
@@ -557,8 +678,8 @@ def _construct_classifiers(
             )
 
             if args.critics:
-                models["critic_model"] = args.critic_model or args.model
-                models["reconciler_model"] = args.reconciler_model or args.model
+                models["critic_model"] = args.critic_model or resolved_models[0]
+                models["reconciler_model"] = args.reconciler_model or resolved_models[0]
                 critic_classifiers = {}
                 reconciler_classifiers = {}
                 for cat in categories:
@@ -829,7 +950,11 @@ def main() -> None:
             label_values = None
             categories_source = "supplied"
             models_final = {
-                "model": args.model,
+                "model": (
+                    args.resolved_classifier_models[0]
+                    if len(args.resolved_classifier_models) == 1
+                    else None
+                ),
                 "induction_model": None,
                 "critic_model": None,
                 "reconciler_model": None,
@@ -886,7 +1011,7 @@ def main() -> None:
             generated = {category_name}
             if args.critics:
                 generated |= {f"{category_name}{suffix}" for suffix in debate.AUDIT_COLUMN_SUFFIXES}
-            elif args.models:
+            elif len(args.resolved_classifier_models) > 1:
                 generated |= {f"{category_name}{suffix}" for suffix in multi_model.AUDIT_COLUMN_SUFFIXES}
             collide = generated & (test_source_cols - ({args.label_column} if args.label_column else set()))
             if collide:
@@ -944,7 +1069,7 @@ def main() -> None:
             check_cols = [category_name]
             if args.critics:
                 check_cols.append(f"{category_name}_votes")
-            elif args.models:
+            elif len(args.resolved_classifier_models) > 1:
                 check_cols += [
                     f"{category_name}_votes",
                     f"{category_name}_by_model",
@@ -958,12 +1083,18 @@ def main() -> None:
             }
             status = "completed_with_failures" if unclassified_positions else "completed"
 
-            if args.models:
-                # Every model starts at 0 so a model that never failed still
-                # shows an explicit zero-count entry, not an omitted key.
-                # Only one category exists per experiment run, so this is a
+            if len(args.resolved_classifier_models) > 1:
+                # Every classifier instance starts at 0 so one that never
+                # failed still shows an explicit zero-count entry, not an
+                # omitted key. Pre-seeded from the actual constructed
+                # classifier keys (occurrence-suffixed where applicable), not
+                # raw --models/--model — a resolved list with repeats would
+                # otherwise collapse duplicate keys during pre-seeding (FR-1.9)
+                # or never be seeded at all for a --model+--n-classifiers
+                # replication (args.models is None in that case). Only one
+                # category exists per experiment run, so this is a
                 # single-column read, not a loop over categories.
-                model_failure_counts = {m: 0 for m in args.models}
+                model_failure_counts = {key: 0 for key in classifiers["multi_model"]}
                 errors_col = f"{category_name}_model_errors"
                 for raw in result_df[errors_col]:
                     if pd.isna(raw):

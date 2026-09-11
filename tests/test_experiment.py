@@ -631,7 +631,7 @@ def test_induce_alone_resolves_induction_model_fallback():
          "--label-column", "label", "--category-name", "cat", "--run-dir", "d",
          "--model", "base-model"]
     )
-    assert ns.model == "base-model"
+    assert ns.model == ["base-model"]  # nargs="+"; resolved to a single value downstream
     assert ns.induction_model is None  # resolved to --model inside _construct_classifiers
 
 
@@ -838,7 +838,7 @@ def test_plain_mode_closed_vocabulary(tmp_path, fake_classify):
 
     cats = load_categories(cats_path)
     args = argparse.Namespace(
-        model="m", allow_new_labels=False, system_prompt=None, task_description=None,
+        model=["m"], allow_new_labels=False, system_prompt=None, task_description=None,
         extra_prompt=None, critics=False, sampling_temperature=0.7, retries=3, api_base=None,
         critic_model=None, reconciler_model=None,
     )
@@ -1036,28 +1036,45 @@ def test_models_and_critics_mutually_exclusive(tmp_path, fake_classify):
     assert fake_classify["calls"] == 0
 
 
-def test_models_requires_at_least_two_values(tmp_path, fake_classify):
+def test_models_single_value_overrides_model_silently(tmp_path, fake_classify):
+    """spec 4 FR-1.1 points 3/9: a single-value --models silently overrides
+    --model and resolves to ordinary single-classifier mode -- it must not
+    require a second value (this used to be an error; the redesign made
+    plain `--models a` behave exactly like `--model a`)."""
     test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
     cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "r"
     code = _run_main(
         ["classify", "--test-file", str(test), "--text-column", "text",
          "--label-column", "label", "--categories", str(cats_path),
-         "--run-dir", str(tmp_path / "r"), "--models", "a"]
+         "--run-dir", str(run_dir), "--models", "only-one"]
     )
-    assert code == 1
-    assert fake_classify["calls"] == 0
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["models"]["model"] == "only-one"
+    assert config["models"]["classification_models"] is None
+    df = pd.read_csv(run_dir / "test_classified.csv")
+    assert "sentiment_by_model" not in df.columns
 
 
-def test_models_rejects_duplicate_value(tmp_path, fake_classify):
+def test_models_duplicate_value_uses_occurrence_suffixed_keys(tmp_path, fake_classify):
+    """spec 4 AR-1.3: --models given 2+ values allows duplicates -- this used
+    to be an error; the redesign preserves duplicates and disambiguates
+    repeated model ids with occurrence-suffixed classifier keys ("a#1",
+    "a#2"), while the once-only id keeps its bare key."""
     test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
     cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "r"
     code = _run_main(
         ["classify", "--test-file", str(test), "--text-column", "text",
          "--label-column", "label", "--categories", str(cats_path),
-         "--run-dir", str(tmp_path / "r"), "--models", "a", "a", "b"]
+         "--run-dir", str(run_dir), "--models", "a", "a", "b"]
     )
-    assert code == 1
-    assert fake_classify["calls"] == 0
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["models"]["model"] is None
+    assert config["models"]["classification_models"] == ["a", "a", "b"]
+    assert set(config["models"]["model_failure_counts"].keys()) == {"a#1", "a#2", "b"}
 
 
 def test_models_rejects_empty_value(tmp_path, fake_classify):
@@ -1089,7 +1106,11 @@ def test_induce_help_does_not_list_models(capsys):
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["induce", "--help"])
-    assert "--models" not in capsys.readouterr().out
+    # --model's own help text legitimately cross-references "--models" in
+    # prose (it's a shared `common`-group flag, so this text is visible even
+    # under `induce`) -- what must NOT appear is the flag's own definition
+    # line, which argparse always renders as "--models MODEL" (its metavar).
+    assert "--models MODEL" not in capsys.readouterr().out
 
 
 def test_models_end_to_end_run_config(tmp_path, fake_classify):
@@ -1103,7 +1124,7 @@ def test_models_end_to_end_run_config(tmp_path, fake_classify):
     )
     assert code in (0, None)
     config = json.loads((run_dir / "run_config.json").read_text())
-    assert config["schema_version"] == 2
+    assert config["schema_version"] == 3
     assert config["models"]["classification_models"] == ["a", "b"]
     assert config["models"]["model"] is None
     assert set(config["models"]["model_failure_counts"].keys()) == {"a", "b"}
@@ -1152,7 +1173,7 @@ def test_models_run_with_induction_merges_all_fields(tmp_path, fake_classify):
         ["run", "--train-file", str(train), "--test-file", str(test),
          "--text-column", "text", "--label-column", "label",
          "--category-name", "sentiment", "--run-dir", str(run_dir),
-         "--model", "induction-model-id", "--models", "a", "b"]
+         "--induction-model", "induction-model-id", "--models", "a", "b"]
     )
     assert code in (0, None)
     config = json.loads((run_dir / "run_config.json").read_text())
@@ -1212,6 +1233,159 @@ def test_models_failure_counts_per_model(tmp_path, monkeypatch):
     counts = config["models"]["model_failure_counts"]
     assert counts["bad"] > 0
     assert counts["good"] == 0  # explicit zero entry, not an omitted key
+
+
+def test_n_classifiers_replication_produces_multi_classifier_run_config(tmp_path, fake_classify):
+    """spec 4: --model x --n-classifiers 3 (no --models) must engage the same
+    downstream sites --models does -- the pre-projection collision check,
+    the post-run completeness check, and failure-count aggregation -- since
+    all three used to gate on raw args.models truthiness (args.models is
+    None here) rather than the resolved classifier list's length. This
+    directly targets the exact regression an earlier draft of this task
+    would have shipped."""
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "r"
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(run_dir), "--model", "x", "--n-classifiers", "3"]
+    )
+    assert code in (0, None)
+    df = pd.read_csv(run_dir / "test_classified.csv")
+    for suffix in ("_votes", "_by_model", "_model_errors"):
+        assert f"sentiment{suffix}" in df.columns
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["unclassified_rows"]["count"] == 0
+    assert config["models"]["classification_models"] == ["x", "x", "x"]
+    counts = config["models"]["model_failure_counts"]
+    assert set(counts.keys()) == {"x#1", "x#2", "x#3"}
+    assert all(v == 0 for v in counts.values())
+
+
+def test_n_classifiers_replication_source_column_collision(tmp_path, fake_classify):
+    """spec 4 AR-1.5: the pre-projection source-column collision check must
+    also gate on the resolved classifier list's length, not raw args.models
+    truthiness -- a --model+--n-classifiers replication (args.models is None)
+    must still detect a pre-existing audit-column-shaped source column."""
+    (tmp_path / "test.csv").write_text("text,label,sentiment_by_model\nhi,positive,bogus\n")
+    cats_path = _write_categories(tmp_path / "cats.json", name="sentiment")
+    code = _run_main(
+        ["classify", "--test-file", str(tmp_path / "test.csv"), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path), "--run-dir", str(tmp_path / "r"),
+         "--model", "x", "--n-classifiers", "3"]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+def test_n_classifiers_repeated_instance_failure_count_keeps_keys_distinct(tmp_path, monkeypatch):
+    """spec 4 FR-1.9's pre-seed fix: when one occurrence of a repeated model
+    fails, its own occurrence-suffixed key must show a nonzero count while
+    the other occurrence of the SAME model shows an explicit 0 -- proving
+    the pre-seed step uses the actual constructed classifier keys, not a raw
+    --models/--model dict-comprehension that would collapse both into one
+    bare "same-model" entry (already covered for distinct models by
+    test_models_failure_counts_per_model above)."""
+    monkeypatch.setattr("query_classification.experiment.cerebus_enabled_via_env", lambda: False)
+
+    construction_order = []
+    original_init = Classifier.__init__
+
+    def recording_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        construction_order.append(id(self))
+
+    def fake_classify_method(self, text):
+        idx = construction_order.index(id(self))
+        if idx == 0:
+            raise RuntimeError("boom")
+        return {"sentiment": ["positive"]}
+
+    monkeypatch.setattr(Classifier, "__init__", recording_init)
+    monkeypatch.setattr(Classifier, "classify", fake_classify_method)
+
+    test = _write_csv(tmp_path / "test.csv", [("hi", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "r"
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(run_dir), "--model", "same-model", "--n-classifiers", "2"]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    counts = config["models"]["model_failure_counts"]
+    assert counts["same-model#1"] > 0
+    assert counts["same-model#2"] == 0
+
+
+# --- _resolve_classifier_models: Shared Resolution Truth Table (spec 4) ---
+
+
+def _resolve(monkeypatch, argv, cerebus_mode=None):
+    from query_classification.experiment import _resolve_classifier_models
+
+    if cerebus_mode is None:
+        monkeypatch.delenv("CEREBUS_MODE", raising=False)
+    else:
+        monkeypatch.setenv("CEREBUS_MODE", cerebus_mode)
+    ns = build_parser().parse_args(["classify", "--text-column", "text", "--run-dir", "d", *argv])
+    return _resolve_classifier_models(ns)
+
+
+def test_experiment_resolve_models_alone_ignores_default_n_classifiers(monkeypatch):
+    """The regression guard: `--models a b c` alone (no --n-classifiers) must
+    resolve to exactly [a, b, c]."""
+    assert _resolve(monkeypatch, ["--models", "a", "b", "c"]) == ["a", "b", "c"]
+
+
+def test_experiment_resolve_models_ignores_n_classifiers_even_when_explicitly_conflicting(monkeypatch):
+    resolved = _resolve(monkeypatch, ["--models", "a", "b", "c", "--n-classifiers", "99"])
+    assert resolved == ["a", "b", "c"]
+
+
+def test_experiment_resolve_n_classifiers_zero_always_errors_even_with_models(monkeypatch):
+    with pytest.raises(ValueError, match="--n-classifiers"):
+        _resolve(monkeypatch, ["--models", "a", "b", "c", "--n-classifiers", "0"])
+
+
+def test_experiment_resolve_model_replication_with_cerebus_azure_mode_succeeds_for_same_model(monkeypatch):
+    """CEREBUS_MODE=azure only blocks 2+ DISTINCT resolved models -- a single
+    model replicated via --n-classifiers must still be allowed."""
+    resolved = _resolve(monkeypatch, ["--model", "a", "--n-classifiers", "3"], cerebus_mode="azure")
+    assert resolved == ["a", "a", "a"]
+
+
+def test_experiment_resolve_models_distinct_with_cerebus_azure_mode_errors(monkeypatch):
+    with pytest.raises(ValueError, match="CEREBUS_MODE=azure"):
+        _resolve(monkeypatch, ["--models", "a", "b"], cerebus_mode="azure")
+
+
+def test_experiment_resolve_induce_ignores_models_attribute_entirely(monkeypatch):
+    """induce's args Namespace has no --models/--n-classifiers attributes at
+    all (only --model lives in the `common` group) -- _resolve_classifier_
+    models must short-circuit via hasattr, not crash with AttributeError."""
+    from query_classification.experiment import _resolve_classifier_models
+
+    monkeypatch.delenv("CEREBUS_MODE", raising=False)
+    ns = build_parser().parse_args(
+        ["induce", "--train-file", "t.csv", "--text-column", "text",
+         "--label-column", "label", "--category-name", "cat", "--run-dir", "d",
+         "--model", "base-model"]
+    )
+    assert _resolve_classifier_models(ns) == ["base-model"]
+
+
+def test_experiment_build_classifier_dict_collision_guard_rejects_pathological_model_id():
+    """AR-1.3's collision guard: if a supplied model id already looks like an
+    occurrence-suffixed key another position would independently produce,
+    raise a clear error instead of silently letting one classifier overwrite
+    the other."""
+    from query_classification.experiment import _build_classifier_dict
+
+    with pytest.raises(ValueError, match="collision"):
+        _build_classifier_dict(["a", "a", "a#1"], lambda m: m)
 
 
 def test_module_invocation_help():

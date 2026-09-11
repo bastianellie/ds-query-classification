@@ -1,6 +1,163 @@
 # Implementation Summary: 4-multi-model-classification
 
 **Status:** Completed
+**Date:** 2026-09-11
+**Worktree:** `/Users/bastianellie/work/elsevier/projects/general/codebase/ds-query-classification-worktrees/4-multi-model-classification` on branch `spec/4-multi-model-classification`
+
+> **Supersedes** the original 2026-09-10 implementation summary below this note. That
+> summary documented the first shipped design (`--models` only, 2+ distinct models
+> required, mutually exclusive with `--critics`). This entry documents the **redesign**
+> requested immediately afterward: `--model`/`--models`/`--n-classifiers` as three
+> independent flags that resolve to one ordered classifier list, per
+> `spec/4-multi-model-classification/spec.md`'s "Reopened 2026-09-10" section and
+> `plan.md`. The original summary is left in place below for history, since most of its
+> "Files Created"/architectural content (`multi_model.py`, `pipeline.py` wiring) is still
+> accurate and unchanged by this redesign.
+
+## Overview
+
+Redesigned the CLI surface for multi-classifier voting mode. `--model` now takes exactly
+one value (`nargs="+"` so a second value is a clear, named error rather than a silent
+drop); `--models` takes 2+ values (duplicates allowed) or exactly 1 (silently overrides
+`--model`); a new `--n-classifiers` (default 1) replicates a single resolved model into N
+independent classifier instances without requiring `--critics`. All three resolve, once,
+to an ordered `list[str]` — length 1 is today's existing plain/`--critics` behavior
+unchanged, length 2+ engages multi-classifier voting. Repeated model ids get
+occurrence-suffixed audit keys (`"<id>#1"`, `"<id>#2"`) so duplicates stay individually
+addressable. `pipeline.py`/`multi_model.py` needed **zero changes** — confirmed via `git
+diff --stat` showing no diff on either file — since both already operate on opaque
+`dict[str, Classifier]` keys.
+
+## Team Execution
+
+Solo, sequential (no subagents, no parallel streams) — the resolution algorithm's
+demonstrated bug density across two prior critique rounds (spec-level and plan-level, see
+`plan-critique-consolidated-v-2.md`) made it safer for one person to implement both
+`cli.py` and `experiment.py`'s independently-duplicated copies with direct, literal
+behavioral parity via `plan.md`'s Shared Resolution Truth Table, rather than risking two
+subagents drifting apart on an edge case.
+
+1. Task 1 — `cli.py` + `tests/test_debate.py`
+2. Task 2 — `experiment.py` + `tests/test_experiment.py`
+3. Task 3 — `README.md`
+
+## Files Modified
+
+- `src/query_classification/cli.py` — `--model` → `nargs="+", default=None`; new
+  `--n-classifiers`; `_resolve_classifier_models(args)` (validation + resolution per the
+  Shared Resolution Truth Table) and `_build_classifier_dict(resolved_models, build_one)`
+  (occurrence-suffixed key construction with a collision guard) replace the old
+  `--models`-only validation block; `allow_new_labels` condition fixed to
+  `args.critics or len(resolved_models) > 1` (keeping `args.critics` — dropping it would
+  have forced `allow_new_labels=True` for ordinary `--critics` usage); classifier
+  construction and `critic_model`/`reconciler_model` fallbacks now read from
+  `resolved_models` instead of raw `args.model` (no longer a plain string).
+- `src/query_classification/experiment.py` — identical redesign, duplicated per this
+  project's established small-duplication convention (module docstring): `--model` →
+  `nargs="+", default=None` in the `common` group; `--n-classifiers` added to the
+  `classification` group (not `common`/`induction`, since `induce` has no classification
+  role); `_resolve_classifier_models`/`_build_classifier_dict`/
+  `_resolve_single_default_model` added; `_validate_args` stores the resolved list as
+  `args.resolved_classifier_models` (computed once, reused by `_construct_classifiers` and
+  `main()`); **every** site that branched on raw `args.models` truthiness now gates on
+  `len(resolved_models) > 1` instead — `_construct_classifiers`'s multi-classifier branch,
+  the no-induction `models_final` fallback, the pre-projection source-column collision
+  check, the post-run completeness check, and the failure-count aggregation's pre-seed
+  step (now seeded from the actual constructed classifier keys, not raw `--models`, so
+  occurrence-suffixed duplicates are no longer silently collapsed/dropped). `induction`
+  model fallback now uses `_resolve_single_default_model(args)` (never one of `--models`'
+  2+ entries, per spec's AR-1.8 4th case). `_SCHEMA_VERSION` bumped `2` → `3`
+  (`model_failure_counts`' keys may now be occurrence-suffixed).
+- `README.md` — "Multi-model mode" retitled "Multi-classifier mode", rewritten for both
+  entry paths (`--models` with 2+ values, or `--model`+`--n-classifiers`); Options table
+  updated (`--model`'s one-value constraint, `--models` duplicates-allowed, new
+  `--n-classifiers` row); Experiment runner section's flag list, data-egress note, and
+  analysis-notebook-compatibility note updated; project-layout entry for `multi_model.py`.
+- `tests/test_debate.py` / `tests/test_experiment.py` — see Test Results below.
+
+## Test Results
+
+`.venv/bin/python -m pytest -q` (full suite, in the worktree): **210 passed**, 0 failures
+(baseline before this redesign: 191). `pipeline.py`/`multi_model.py` have zero diff.
+
+**Existing tests updated** (behavior reversed by the redesign, verified against actual
+bodies, not just names):
+- `test_cli_models_fewer_than_two_exits_before_any_llm_call` /
+  `test_cli_models_duplicate_value_exits_before_any_llm_call` (`test_debate.py`) → renamed
+  and rewritten as `test_cli_models_single_value_overrides_model_silently` /
+  `test_cli_models_duplicate_value_uses_occurrence_suffixed_keys` (both now assert success).
+- `test_models_requires_at_least_two_values` / `test_models_rejects_duplicate_value`
+  (`test_experiment.py`) → same rename/rewrite pattern.
+- `test_induce_alone_resolves_induction_model_fallback` — `ns.model` assertion updated for
+  `nargs="+"` (`"base-model"` → `["base-model"]`).
+- `test_models_end_to_end_run_config` — `schema_version` assertion `2` → `3`.
+- `test_models_run_with_induction_merges_all_fields` — argv rewritten from `--model
+  induction-model-id --models a b` (now illegal — `--model` explicit + `--models` 2+
+  values) to `--induction-model induction-model-id --models a b`.
+- `test_induce_help_does_not_list_models` — loosened from a raw `"--models" not in`
+  substring check (which broke on `--model`'s own help text legitimately cross-referencing
+  `--models` in prose) to checking for the flag's own definition line (`"--models MODEL"`).
+- `test_plain_mode_closed_vocabulary` — its hand-built `argparse.Namespace` updated
+  (`model="m"` → `model=["m"]`) to match the new `nargs="+"` shape; caught independently
+  during implementation (not flagged by either critique round) by reasoning through what
+  `_construct_classifiers` would do with a bare one-character string under the new list-
+  based resolution (silently correct only by coincidence for a 1-character model id).
+
+**New tests** (Shared Resolution Truth Table coverage, repeated-instance behavior, and the
+three previously-missed `experiment.py` downstream sites), in both test files:
+`_resolve_classifier_models`/`_build_classifier_dict` direct unit tests (regression guard
+for `--models a b c` alone, `--n-classifiers` irrelevance once `--models` has 2+ values,
+the universal `--n-classifiers >= 1` floor, `--model`+`--n-classifiers` under
+`CEREBUS_MODE=azure` succeeding vs. `--models` with 2+ distinct models under the same
+erroring, the pathological-model-id collision guard); an exact-call-count test for
+`--model x --n-classifiers 5`; an out-of-order-completion tie-break test and a
+partial-failure test for two instances sharing one model id; and, in `test_experiment.py`
+specifically, a `--model x --n-classifiers 3` end-to-end test asserting the multi-
+classifier audit columns/completeness check/`model_failure_counts` all engage correctly
+with `args.models is None`, plus a dedicated source-column-collision regression test for
+that same `args.models is None` case (the exact scenario the three previously-missed
+downstream sites would have silently mishandled).
+
+CLI surface verified directly: `classify.py --help`, `python -m query_classification
+--help`, `experiment.py classify --help`, `experiment.py run --help` all show
+`--n-classifiers` and `--model`'s updated one-value help text; `experiment.py induce
+--help` shows `--model` but not `--n-classifiers`'s own flag definition.
+
+## Spec Adherence
+
+| Requirement | Status | Implementation | Test |
+|---|---|---|---|
+| FR-1.1 | Done | `cli.py::_resolve_classifier_models`, `experiment.py::_resolve_classifier_models` | Shared Resolution Truth Table tests in both `test_debate.py` and `test_experiment.py` (`_resolve`/`test_resolve_*`, `test_experiment_resolve_*`) |
+| FR-1.2 | Done | shared `temperature=None`/prompt/schema per instance (`_build_classifier_dict`) | `test_cli_n_classifiers_replication_calls_every_instance_exactly_once` |
+| FR-1.3 | Done | unaffected in `multi_model.py`; new same-model tie-break case | `test_cli_n_classifiers_repeated_instance_tie_break_by_construction_order` |
+| FR-1.4 / FR-1.7 | Done | `_build_classifier_dict`'s occurrence-suffixed keys, both files | `test_cli_models_duplicate_value_uses_occurrence_suffixed_keys`, `test_models_duplicate_value_uses_occurrence_suffixed_keys`, `test_cli_n_classifiers_repeated_instance_partial_failure_keeps_suffixed_keys_distinct`, `test_n_classifiers_repeated_instance_failure_count_keeps_keys_distinct` |
+| FR-1.5 / FR-1.6 | Unaffected (confirmed) | `pipeline.py`/`multi_model.py` zero diff | pre-existing `test_multi_model.py` suite, still passing |
+| FR-1.8 | Done | both entry points redesigned identically | full suite + `--help` checks above |
+| FR-1.9 | Done | `experiment.py::_construct_classifiers`/`main`, `_SCHEMA_VERSION = 3` | `test_models_end_to_end_run_config`, `test_models_duplicate_value_uses_occurrence_suffixed_keys` (asserts `model is None`), `test_n_classifiers_replication_produces_multi_classifier_run_config`, `test_n_classifiers_repeated_instance_failure_count_keeps_keys_distinct`, `test_models_non_models_run_has_null_keys` (unaffected case) |
+| FR-1.10 | Done | — | this test suite |
+| AR-1.1 / AR-1.2 | Confirmed unaffected | — | `git diff --stat` shows zero diff on `pipeline.py`/`multi_model.py` |
+| AR-1.3 | Done | `_build_classifier_dict` (both files), collision guard | `test_build_classifier_dict_collision_guard_rejects_pathological_model_id`, `test_experiment_build_classifier_dict_collision_guard_rejects_pathological_model_id` |
+| AR-1.4 / AR-1.5 | Done | `experiment.py`'s completeness check and source-column collision check, both switched to `len(resolved_models) > 1` | `test_n_classifiers_replication_produces_multi_classifier_run_config`, `test_n_classifiers_replication_source_column_collision` |
+| AR-1.6 | Unaffected (confirmed) | `multi_model.py` zero diff | pre-existing concurrency/tally tests, still passing |
+| AR-1.7 | Done | identical `gateway_kwargs`/prompt/schema shared across every constructed instance | pre-existing Cerebus-routing and `allow_new_labels` carve-out tests, still passing |
+| AR-1.8 | Done | `--model` `nargs="+"`, `default=None`, in both files; 4-case induction-fallback resolution | `test_experiment_resolve_induce_ignores_models_attribute_entirely`, `test_induce_alone_resolves_induction_model_fallback`, `test_resolve_model_replication_with_cerebus_azure_mode_succeeds_for_same_model` |
+| AR-1.9 | Done | `README.md` | manual read-through per plan Task 3 |
+
+All 10 FRs and 9 ARs implemented/confirmed-unaffected and verified. No skipped or
+partially-implemented requirements.
+
+## Deviations from Spec
+
+None. `plan.md`'s Spec Deviations table was empty going into implementation (both genuine
+spec-level defects the plan critique found — the backwards `model`-null condition, the
+missing 4th induction-fallback case — were fixed directly in `spec.md` before this
+implementation began, not worked around here).
+
+---
+
+# Implementation Summary: 4-multi-model-classification (original, 2026-09-10, superseded above)
+
+**Status:** Completed
 **Date:** 2026-09-10
 **Worktree:** `/Users/bastianellie/work/elsevier/projects/general/codebase/ds-query-classification-worktrees/4-multi-model-classification` on branch `spec/4-multi-model-classification`
 

@@ -814,16 +814,33 @@ def test_cli_models_and_critics_mutually_exclusive_exits_before_any_llm_call(
     assert "--models" in capsys.readouterr().out
 
 
-def test_cli_models_fewer_than_two_exits_before_any_llm_call(monkeypatch, tmp_path, capsys):
+def test_cli_models_single_value_overrides_model_silently(monkeypatch, tmp_path):
+    """spec 4 FR-1.1 points 3/9: a single-value --models silently overrides
+    --model and resolves to ordinary single-classifier mode -- it must not
+    require a second value (this used to be an error; the redesign made
+    plain `--models a` behave exactly like `--model a`)."""
     from query_classification import cli
+
+    _neutralize_real_dotenv(monkeypatch, cli)
 
     input_csv = tmp_path / "in.csv"
     pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
 
-    def boom(*a, **kw):
-        raise AssertionError("classify_csv should not be reached")
+    constructed = []
+    original_classifier = Classifier
 
-    monkeypatch.setattr(cli, "classify_csv", boom)
+    class RecordingClassifier(original_classifier):
+        def __init__(self, *args, **kwargs):
+            constructed.append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    calls = {}
+
+    def fake_classify_csv(*a, **kw):
+        calls.update(kw)
+
+    monkeypatch.setattr(cli, "Classifier", RecordingClassifier)
+    monkeypatch.setattr(cli, "classify_csv", fake_classify_csv)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -831,25 +848,36 @@ def test_cli_models_fewer_than_two_exits_before_any_llm_call(monkeypatch, tmp_pa
             "classify.py",
             "--input", str(input_csv),
             "--column", "text",
+            "--output", str(tmp_path / "out.csv"),
             "--models", "only-one",
         ],
     )
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main()
-    assert exc_info.value.code == 1
-    assert "--models" in capsys.readouterr().out
+    cli.main()
+
+    assert len(constructed) == 1
+    assert constructed[0]["model_id"] == "only-one"
+    assert calls["models"] is None
+    assert calls["classifier"] is not None
 
 
-def test_cli_models_duplicate_value_exits_before_any_llm_call(monkeypatch, tmp_path, capsys):
+def test_cli_models_duplicate_value_uses_occurrence_suffixed_keys(monkeypatch, tmp_path):
+    """spec 4 AR-1.3: --models given 2+ values allows duplicates -- this used
+    to be an error; the redesign preserves duplicates and disambiguates
+    repeated model ids with occurrence-suffixed classifier keys ("a#1",
+    "a#2"), while the once-only id keeps its bare key."""
     from query_classification import cli
+
+    _neutralize_real_dotenv(monkeypatch, cli)
 
     input_csv = tmp_path / "in.csv"
     pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
 
-    def boom(*a, **kw):
-        raise AssertionError("classify_csv should not be reached")
+    calls = {}
 
-    monkeypatch.setattr(cli, "classify_csv", boom)
+    def fake_classify_csv(*a, **kw):
+        calls.update(kw)
+
+    monkeypatch.setattr(cli, "classify_csv", fake_classify_csv)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -857,13 +885,14 @@ def test_cli_models_duplicate_value_exits_before_any_llm_call(monkeypatch, tmp_p
             "classify.py",
             "--input", str(input_csv),
             "--column", "text",
+            "--output", str(tmp_path / "out.csv"),
             "--models", "a", "a", "b",
         ],
     )
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main()
-    assert exc_info.value.code == 1
-    assert "--models" in capsys.readouterr().out
+    cli.main()
+
+    assert calls["classifier"] is None
+    assert set(calls["models"].keys()) == {"a#1", "a#2", "b"}
 
 
 def test_cli_models_empty_value_exits_before_any_llm_call(monkeypatch, tmp_path, capsys):
@@ -1060,3 +1089,218 @@ def test_cli_models_mode_cerebus_routes_all_models_through_same_gateway_config(
         assert kw["api_base"] == fake_gateway["api_base"]
         assert kw["api_key"] == fake_gateway["api_key"]
         assert kw["extra_headers"] == fake_gateway["extra_headers"]
+
+
+# --- _resolve_classifier_models: Shared Resolution Truth Table (spec 4) ---
+
+
+def _resolve(monkeypatch, argv, cerebus_mode=None):
+    from query_classification import cli
+
+    if cerebus_mode is None:
+        monkeypatch.delenv("CEREBUS_MODE", raising=False)
+    else:
+        monkeypatch.setenv("CEREBUS_MODE", cerebus_mode)
+    ns = cli.build_parser().parse_args(["--input", "unused.csv", "--column", "text", *argv])
+    return cli._resolve_classifier_models(ns)
+
+
+def test_resolve_models_alone_ignores_default_n_classifiers(monkeypatch):
+    """The regression guard: `--models a b c` alone (no --n-classifiers) must
+    resolve to exactly [a, b, c] -- this is the exact case that an earlier
+    draft of this redesign silently broke by requiring --n-classifiers to
+    match len(--models)."""
+    assert _resolve(monkeypatch, ["--models", "a", "b", "c"]) == ["a", "b", "c"]
+
+
+def test_resolve_models_ignores_n_classifiers_even_when_explicitly_conflicting(monkeypatch):
+    """--n-classifiers plays no role at all once --models has 2+ values --
+    not even as a validation check -- so an explicitly conflicting value is
+    silently ignored rather than raising."""
+    resolved = _resolve(monkeypatch, ["--models", "a", "b", "c", "--n-classifiers", "99"])
+    assert resolved == ["a", "b", "c"]
+
+
+def test_resolve_n_classifiers_zero_always_errors_even_with_models(monkeypatch):
+    """The `--n-classifiers >= 1` floor is universal -- it is the one check
+    that still applies even when --models has 2+ values and would otherwise
+    make --n-classifiers irrelevant."""
+    with pytest.raises(ValueError, match="--n-classifiers"):
+        _resolve(monkeypatch, ["--models", "a", "b", "c", "--n-classifiers", "0"])
+
+
+def test_resolve_model_replication_with_cerebus_azure_mode_succeeds_for_same_model(monkeypatch):
+    """CEREBUS_MODE=azure only blocks 2+ DISTINCT resolved models -- a single
+    model replicated via --n-classifiers must still be allowed."""
+    resolved = _resolve(
+        monkeypatch, ["--model", "a", "--n-classifiers", "3"], cerebus_mode="azure"
+    )
+    assert resolved == ["a", "a", "a"]
+
+
+def test_resolve_models_distinct_with_cerebus_azure_mode_errors(monkeypatch):
+    with pytest.raises(ValueError, match="CEREBUS_MODE=azure"):
+        _resolve(monkeypatch, ["--models", "a", "b"], cerebus_mode="azure")
+
+
+def test_build_classifier_dict_collision_guard_rejects_pathological_model_id(monkeypatch):
+    """AR-1.3's collision guard: if a supplied model id already looks like an
+    occurrence-suffixed key another position would independently produce
+    (e.g. a literal "a#1" alongside two plain "a"s), raise a clear error
+    instead of silently letting one classifier overwrite the other."""
+    from query_classification import cli
+
+    with pytest.raises(ValueError, match="collision"):
+        cli._build_classifier_dict(["a", "a", "a#1"], lambda m: m)
+
+
+# --- Repeated-instance behavior end-to-end (spec 4 FR-1.2/FR-1.3/FR-1.7) --
+
+
+def test_cli_n_classifiers_replication_calls_every_instance_exactly_once(monkeypatch, tmp_path):
+    """spec 4 FR-1.2 for the --n-classifiers replication case: --model x
+    --n-classifiers 5 must construct 5 independent classifier instances and
+    call every one of them exactly once per row -- not fewer, e.g. from an
+    accidental dict-collapse bug when all 5 share the same model id."""
+    from query_classification import cli
+
+    _neutralize_real_dotenv(monkeypatch, cli)
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+    categories_file = tmp_path / "categories.json"
+    _write_sentiment_categories_json(categories_file)
+    out = tmp_path / "out.csv"
+
+    call_count = {"n": 0}
+
+    def fake_classify(self, text):
+        call_count["n"] += 1
+        return {"sentiment": ["positive"]}
+
+    monkeypatch.setattr(Classifier, "classify", fake_classify)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--output", str(out),
+            "--categories", str(categories_file),
+            "--model", "same-model",
+            "--n-classifiers", "5",
+        ],
+    )
+    cli.main()
+
+    assert call_count["n"] == 5
+    cols = list(pd.read_csv(out).columns)
+    for suffix in multi_model.AUDIT_COLUMN_SUFFIXES:
+        assert f"sentiment{suffix}" in cols
+
+
+def test_cli_n_classifiers_repeated_instance_tie_break_by_construction_order(monkeypatch, tmp_path):
+    """spec 4 FR-1.3 for the new same-model-repeated case this redesign adds
+    (the original implementation only ever tested distinct-model ties): when
+    two classifier instances share a model id, the plurality tie-break must
+    still go to the earlier-constructed occurrence ("same-model#1"), even
+    when it resolves SLOWER than the later occurrence ("same-model#2")."""
+    from query_classification import cli
+
+    _neutralize_real_dotenv(monkeypatch, cli)
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+    categories_file = tmp_path / "categories.json"
+    _write_sentiment_categories_json(categories_file)
+    out = tmp_path / "out.csv"
+
+    construction_order = []
+    original_init = Classifier.__init__
+
+    def recording_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        construction_order.append(id(self))
+
+    def fake_classify(self, text):
+        idx = construction_order.index(id(self))
+        if idx == 0:
+            time.sleep(0.08)
+            return {"sentiment": ["positive"]}
+        return {"sentiment": ["negative"]}
+
+    monkeypatch.setattr(Classifier, "__init__", recording_init)
+    monkeypatch.setattr(Classifier, "classify", fake_classify)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--output", str(out),
+            "--categories", str(categories_file),
+            "--model", "same-model",
+            "--n-classifiers", "2",
+        ],
+    )
+    cli.main()
+
+    result = pd.read_csv(out)
+    assert result.loc[0, "sentiment"] == "['positive']"
+
+
+def test_cli_n_classifiers_repeated_instance_partial_failure_keeps_suffixed_keys_distinct(
+    monkeypatch, tmp_path
+):
+    """spec 4 AR-1.3/FR-1.7: when one occurrence of a repeated model fails,
+    the audit trail must attribute the failure to its own occurrence-
+    suffixed key ("same-model#1") while the other occurrence ("same-
+    model#2") is recorded as a normal success -- proving the two occurrences
+    remain independently addressable, not merged."""
+    from query_classification import cli
+
+    _neutralize_real_dotenv(monkeypatch, cli)
+
+    input_csv = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["hello"]}).to_csv(input_csv, index=False)
+    categories_file = tmp_path / "categories.json"
+    _write_sentiment_categories_json(categories_file)
+    out = tmp_path / "out.csv"
+
+    construction_order = []
+    original_init = Classifier.__init__
+
+    def recording_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        construction_order.append(id(self))
+
+    def fake_classify(self, text):
+        idx = construction_order.index(id(self))
+        if idx == 0:
+            raise RuntimeError("model boom")
+        return {"sentiment": ["positive"]}
+
+    monkeypatch.setattr(Classifier, "__init__", recording_init)
+    monkeypatch.setattr(Classifier, "classify", fake_classify)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "classify.py",
+            "--input", str(input_csv),
+            "--column", "text",
+            "--output", str(out),
+            "--categories", str(categories_file),
+            "--model", "same-model",
+            "--n-classifiers", "2",
+        ],
+    )
+    cli.main()
+
+    result = pd.read_csv(out)
+    errors = json.loads(result.loc[0, "sentiment_model_errors"])
+    by_model = json.loads(result.loc[0, "sentiment_by_model"])
+    assert set(errors.keys()) == {"same-model#1"}
+    assert set(by_model.keys()) == {"same-model#2"}

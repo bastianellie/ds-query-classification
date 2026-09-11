@@ -73,38 +73,64 @@ model`/`--reconciler-model` can each point at a different LiteLLM model than
 model resolves to; make sure that's intentional before pointing them at a
 different provider than your main classification calls.
 
-### Multi-model mode: N distinct models, merged by plurality vote
+### Multi-classifier mode: N classifier instances, merged by plurality vote
 
-`--models` is a standalone alternative to `--critics` (mutually exclusive with
-it): 2 or more distinct LiteLLM model ids each classify a row once,
-independently — no sampling, no Critic/Reconciler debate — and the results are
-merged per category by plurality vote on each model's top label. Ties are
-broken in favor of whichever tied label the earliest-listed model picked. Adds
-a per-model/vote-tally/failure audit trail to the output CSV:
+`--models`/`--n-classifiers` is a standalone alternative to `--critics`
+(mutually exclusive with it when 2+ distinct models or `--n-classifiers > 1`
+are in play): N classifier instances each classify a row once, independently —
+no sampling, no Critic/Reconciler debate — and the results are merged per
+category by plurality vote on each instance's top label. Ties are broken in
+favor of whichever tied label the earliest-listed/constructed instance picked.
+Adds a per-instance/vote-tally/failure audit trail to the output CSV.
+
+Two ways to get there:
 
 ```bash
+# 2+ distinct models, one classifier each (duplicates allowed, e.g. to give
+# one model extra weight in the vote):
 python classify.py \
   --input data/queries.csv \
   --column text \
   --output output/queries_classified.csv \
   --categories resources/categories/example_support_tickets.json \
   --models azure/gpt-5-chat gpt-4o-mini gemini/gemini-2.5-pro
+
+# One model, replicated into N independent classifier instances (a plurality
+# vote of N samples from the same model, without --critics' sampling/debate
+# machinery):
+python classify.py \
+  --input data/queries.csv \
+  --column text \
+  --output output/queries_classified.csv \
+  --categories resources/categories/example_support_tickets.json \
+  --model azure/gpt-5-chat \
+  --n-classifiers 5
 ```
 
-This multiplies per-row LLM call volume by the number of models given (before
-any internal retries/JSON-mode fallback), and concurrent in-flight requests
-are roughly `--workers × <number of models>` — size `--workers` down
-accordingly for large inputs, same as `--critics`. Each model in `--models`
-gets the identical system prompt/schema/`--allow-new-labels` setting and its
-own provider default temperature (not `--critics`' `--sampling-temperature`).
-As with `--critic-model`/`--reconciler-model`, the same row text is sent to
-every provider each listed model resolves to — this is a bigger data-egress
-surface than a single `--model`, since it's N providers instead of one; make
-sure that's intentional for sensitive input before pointing `--models` at
-providers outside your usual one. `--models` cannot be combined with
-`CEREBUS_MODE=azure` (`CEREBUS_CONFIG_ID` is a single, workspace/model-specific
-value that can't apply to several distinct models); it works normally with
-Cerebus direct mode or with direct providers.
+A single-value `--models` is equivalent to `--model` (silently overrides it if
+both are given). `--n-classifiers` only matters when replicating one resolved
+model — it has no effect when `--models` is given 2+ values, where the
+classifier count is simply the number of values given. In the audit trail,
+each classifier instance is keyed by its bare model id, unless that id repeats
+in the resolved list, in which case every occurrence gets an occurrence-
+suffixed key (e.g. `azure/gpt-5-chat#1`, `azure/gpt-5-chat#2`) so repeated
+instances stay individually addressable.
+
+This multiplies per-row LLM call volume by the number of classifier instances
+(before any internal retries/JSON-mode fallback), and concurrent in-flight
+requests are roughly `--workers × <number of instances>` — size `--workers`
+down accordingly for large inputs, same as `--critics`. Every instance gets
+the identical system prompt/schema/`--allow-new-labels` setting and its own
+provider default temperature (not `--critics`' `--sampling-temperature`). As
+with `--critic-model`/`--reconciler-model`, the same row text is sent to every
+provider each listed model resolves to — this is a bigger data-egress surface
+than a single `--model`, since it's potentially N providers instead of one;
+make sure that's intentional for sensitive input before pointing `--models` at
+providers outside your usual one. 2+ *distinct* resolved models cannot be
+combined with `CEREBUS_MODE=azure` (`CEREBUS_CONFIG_ID` is a single,
+workspace/model-specific value that can't apply to several distinct models) —
+replicating a single model via `--n-classifiers` is unaffected; it works
+normally with Cerebus direct mode or with direct providers.
 
 ### Reproducing the original decision-classification setup
 
@@ -125,7 +151,7 @@ python classify.py \
 | `-c, --column` | Name of the text column to classify (required). |
 | `-o, --output` | Output CSV file. **Omitting it overwrites the input in place.** |
 | `--categories` | Categories JSON file (default: bundled example). |
-| `--model` | LiteLLM model id (default: `azure/gpt-5-chat`). |
+| `--model` | LiteLLM model id (default: `azure/gpt-5-chat`). Accepts exactly one value — use `--models` for multiple, or `--n-classifiers` to replicate this one model into several independent classifier instances. |
 | `--api-base` | Override the API endpoint/base URL (default: resolved from the first of `LITELLM_API_BASE`, `AZURE_API_BASE`, `AZURE_OPENAI_ENDPOINT`, `OPENAI_BASE_URL`, `OPENAI_API_BASE` that is set). |
 | `--system-prompt` | Override the system prompt template. |
 | `--task-description` | Text file describing the task/domain (`{task_description}` slot). |
@@ -141,7 +167,8 @@ python classify.py \
 | `--allow-new-labels` | Under `--critics`, allow suggesting `"none - <new label>"` instead of only predefined labels/`"none"`. |
 | `--critic-model` | LiteLLM model id for the `--critics` Critic role (default: `--model`). |
 | `--reconciler-model` | LiteLLM model id for the `--critics` Reconciler role (default: `--model`). |
-| `--models` | 2+ distinct model ids for multi-model voting mode (see above); mutually exclusive with `--critics`. |
+| `--models` | 2+ model ids (duplicates allowed) for multi-classifier voting mode (see above); a single value is equivalent to `--model`. Mutually exclusive with `--critics` when given 2+ values. |
+| `--n-classifiers` | Number of classifier instances to construct (default: 1); replicates a single resolved model. No effect when `--models` has 2+ values. Mutually exclusive with `--critics` when > 1. |
 | `--cerebus` | Route every LLM call through the Cerebus/Portkey gateway instead of a direct provider (see below). |
 
 ## Cerebus / Portkey gateway
@@ -210,11 +237,13 @@ python experiment.py run \
 
 Equivalent to `python -m query_classification.experiment ...`. All of
 `classify.py`'s classifier-configuration flags are available on
-`classify`/`run` (`--model`, `--critics`, `--models`, `--sampling-runs`, ...) —
-not `induce`, which has no classification role; `induce`/`run` additionally
-take `--seed`, `--examples-per-label`, `--max-example-chars`,
-`--max-prompt-chars`, and `--induction-model`. `--cerebus` is available on all
-three subcommands (it applies to the induction call too). One exception:
+`classify`/`run` (`--model`, `--critics`, `--models`, `--n-classifiers`,
+`--sampling-runs`, ...) — not `induce`, which has no classification role (only
+`--model` lives in the group shared with `induce`, for its induction-model
+fallback); `induce`/`run` additionally take `--seed`, `--examples-per-label`,
+`--max-example-chars`, `--max-prompt-chars`, and `--induction-model`.
+`--cerebus` is available on all three subcommands (it applies to the
+induction call too). One exception:
 `classify.py`'s `--limit` is called `--test-limit` here, to make clear it only
 bounds the test split being classified (not the train split used for
 induction); omitting it classifies the entire test split. `--restore` has no
@@ -250,20 +279,21 @@ actually match a prediction.
 
 **Data egress note:** the `induce` subcommand sends sampled **train** text to
 whichever model `--induction-model` (or `--model`) resolves to; `classify`/
-`run` send **test** text to `--model` (and, under `--critics`, to
-`--critic-model`/`--reconciler-model` too; under `--models`, to every one of
-the 2+ listed models — a bigger egress surface than any single-model mode,
-since it's N providers instead of one). Point any of these at a different
-provider than your default only if you intend that split's text to go there.
-As with `classify.py`, output CSV cells (including `--models`' new
-`_votes`/`_by_model`/`_model_errors` audit columns) are not sanitized against
-spreadsheet-formula injection if opened in a spreadsheet application — treat
-`test_classified.csv` as you would any other untrusted CSV before opening it
-that way.
+`run` send **test** text to the resolved classifier model(s) (and, under
+`--critics`, to `--critic-model`/`--reconciler-model` too; under multi-
+classifier mode with 2+ *distinct* resolved models, to every one of them — a
+bigger egress surface than any single-model mode, since it's N providers
+instead of one; replicating one model via `--n-classifiers` stays a single
+provider). Point any of these at a different provider than your default only
+if you intend that split's text to go there. As with `classify.py`, output CSV
+cells (including multi-classifier mode's `_votes`/`_by_model`/`_model_errors`
+audit columns) are not sanitized against spreadsheet-formula injection if
+opened in a spreadsheet application — treat `test_classified.csv` as you would
+any other untrusted CSV before opening it that way.
 
 **Analysis notebook compatibility:** `experiments/ag-news/analyze_run.ipynb`
 reads `--critics`-specific columns (`_initial`/`_votes`/`_challenged`/
-`_reconciled`) and cannot analyze a `--models` run's output as-is.
+`_reconciled`) and cannot analyze a multi-classifier run's output as-is.
 
 ## Defining categories
 
@@ -296,7 +326,7 @@ src/query_classification/
   classifier.py   # single-text LLM classification (Classifier)
   pipeline.py     # CSV batch loop (restore / limit / incremental save)
   debate.py       # --critics: sampling, consensus voting, Critic/Reconciler debate
-  multi_model.py  # --models: N-model plurality-vote classification/audit trail
+  multi_model.py  # --models/--n-classifiers: N-classifier plurality-vote classification/audit trail
   cli.py          # argparse entry point (classify.py)
   dataset_io.py   # local/HF dataset loading, label normalization, row filtering
   induction.py    # category induction: sampling, one LLM call, reconciliation
