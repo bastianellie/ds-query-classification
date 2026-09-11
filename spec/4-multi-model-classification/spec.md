@@ -6,6 +6,9 @@
 > **Reopened 2026-09-10** for a follow-up CLI-surface redesign (`--model`/`--models`/
 > `--n-classifiers`) — see the Change Log's final entry. The status block above records
 > the *original* feature's close; this reopening does not un-close it, it amends it.
+> **Re-closed 2026-09-11** — the redesign is implemented and verified; see
+> `implementation-summary.md`'s "Supersedes" note at the top. Re-merged from worktree
+> branch `spec/4-multi-model-classification` on 2026-09-11.
 
 ## Overview
 
