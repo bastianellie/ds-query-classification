@@ -115,29 +115,44 @@ def build_reconciler_model(category: Category) -> type[BaseModel]:
     return ReconcilerVerdict
 
 
-def build_induction_model() -> type[BaseModel]:
-    """Build the output schema for the category-induction call.
+def build_induction_model(n_labels: int) -> type[BaseModel]:
+    """Build the output schema for the category-induction call: one
+    **required** ``description_i`` field per label position (1-indexed), plus
+    ``category_description``. Carries no label names at all -- label identity
+    comes from the runner's own sorted label list (``induction.py``), never
+    from the model's response, so a missing/invented label is structurally
+    impossible rather than something to reconcile after the fact.
 
-    Unlike its three siblings above, this model is **fixed**, not parameterized
-    by category/labels: induction is exactly the process of inferring the label
-    set, so there is nothing yet to parameterize it with. The result is a
-    ``list`` of label/description pairs rather than a dynamic field per label,
-    because label values are dataset-chosen strings that routinely aren't valid
-    Python/Pydantic identifiers (``"very negative"``, ``"class 1"``), and a list
-    entry is comparable for exact reconciliation later, whereas an unexpected
-    object key would be silently dropped by Pydantic's default extra-field
-    handling.
+    Field names are positional indices, not label values, and arity is pinned
+    by making every ``description_i`` field required -- not by a length-bounded
+    ``list`` field. Both choices are forced, not stylistic:
+
+    - Label values are dataset-chosen strings that routinely aren't valid
+      Python/Pydantic identifiers (``"very negative"``, ``"class 1"``), so a
+      field-*per-label-value* model (unlike ``build_classification_model``'s
+      dynamic-field approach) would break for exactly the datasets this
+      targets. Indices are always valid identifiers.
+    - Verified against the installed stack: ``litellm`` serializes a Pydantic
+      ``response_format`` with ``"strict": true``, and strict structured
+      output does not support ``minItems``/``maxItems`` -- a length-bounded
+      ``list`` would be rejected by the provider, silently degrading every
+      induction call to JSON-object-mode fallback
+      (``Classifier._attempt_completion``'s ``except litellm.BadRequestError``).
+      Required fields plus strict mode's ``additionalProperties: false``
+      express exactly-``n_labels`` in a form the strict path accepts.
+
+    Uses the same ``create_model`` mechanism as ``build_classification_model``
+    above, differing only in that the dynamic field names are positional
+    indices rather than caller-chosen names.
     """
+    if n_labels < 1:
+        raise ValueError(f"n_labels must be >= 1, got {n_labels}")
 
-    class InductionLabel(BaseModel):
-        label: str
-        description: str
+    fields: dict[str, Any] = {"category_description": (str, ...)}
+    for i in range(1, n_labels + 1):
+        fields[f"description_{i}"] = (str, ...)
 
-    class InductionResult(BaseModel):
-        category_description: str
-        labels: list[InductionLabel]
-
-    return InductionResult
+    return create_model("InductionResult", **fields)
 
 
 def schema_description(model: type[BaseModel]) -> str:

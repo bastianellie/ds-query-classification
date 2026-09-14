@@ -240,12 +240,12 @@ Equivalent to `python -m query_classification.experiment ...`. All of
 `classify`/`run` (`--model`, `--critics`, `--models`, `--n-classifiers`,
 `--sampling-runs`, ...) — not `induce`, which has no classification role (only
 `--model` lives in the group shared with `induce`, for its induction-model
-fallback); `induce`/`run` additionally take `--seed`, `--examples-per-label`,
-`--max-example-chars`, `--max-prompt-chars`, `--induction-model`, and
-`--induction-retries` (default 3 — retries the induction call if its response's
-label set doesn't match the dataset's actual labels, since the induction output
-schema is an open-ended list rather than one slot per known label, so nothing
-stops the model from silently omitting or inventing one).
+fallback); `induce`/`run` additionally take `--seed`, `--examples-per-label`
+(default 20, per-label sampling cap), `--induction-examples` (a total example
+budget across all labels instead, split as evenly as possible — mutually
+exclusive with `--examples-per-label`, and requires at least one example per
+distinct label; makes prompt size independent of the label count),
+`--max-example-chars`, `--max-prompt-chars`, and `--induction-model`.
 `--cerebus` is available on all three subcommands (it applies to the
 induction call too). One exception:
 `classify.py`'s `--limit` is called `--test-limit` here, to make clear it only

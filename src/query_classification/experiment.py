@@ -83,7 +83,7 @@ _ARTIFACT_FILENAMES = (
 _RESERVED_SENTINEL_PREFIX = "none - "
 _RESERVED_SENTINEL = "none"
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +167,22 @@ def build_parser() -> argparse.ArgumentParser:
     induction.add_argument(
         "--examples-per-label",
         type=int,
-        default=20,
+        default=None,
         metavar="N",
-        help="Max sampled examples per label for induction (default: 20)",
+        help="Max sampled examples per label for induction (default: 20). Mutually "
+        "exclusive with --induction-examples.",
+    )
+    induction.add_argument(
+        "--induction-examples",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Total example budget across all labels for induction, split as evenly "
+        "as possible (largest-remainder quotas; a label with fewer usable rows than "
+        "its quota contributes all of them, and the freed slots are re-divided among "
+        "labels that still have spare rows). Must be >= the number of distinct "
+        "labels. Mutually exclusive with --examples-per-label; makes prompt size "
+        "independent of the label count, unlike --examples-per-label.",
     )
     induction.add_argument(
         "--max-example-chars",
@@ -188,18 +201,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     induction.add_argument(
         "--induction-model", metavar="MODEL", help="LiteLLM model id for induction; defaults to --model"
-    )
-    induction.add_argument(
-        "--induction-retries",
-        type=int,
-        default=3,
-        metavar="N",
-        help="Retry attempts if the induction response's label set doesn't match the "
-        "dataset's labels (missing or invented entries) -- a plausible one-off LLM "
-        "slip, not necessarily systemic, more likely with a larger --examples-per-label "
-        "or label count (default: 3). Each retry re-sends the identical prompt; only "
-        "the induction model's own non-zero temperature gives it a chance at a "
-        "different response.",
     )
 
     classification = argparse.ArgumentParser(add_help=False)
@@ -434,11 +435,27 @@ def _validate_args(args: argparse.Namespace) -> None:
             "here (did you mean 'classify' or 'run'?)"
         )
 
+    # FR-2.1: exactly one of --examples-per-label/--induction-examples, or
+    # neither (defaulting to --examples-per-label's literal 20 at resolution
+    # time -- see _resolve_induction_sizing). Both are absent entirely on
+    # `classify` (not a parent of that subparser), so getattr(..., None) is
+    # the correct check there too: neither being present is neither being
+    # given, not a conflict.
+    if (
+        getattr(args, "examples_per_label", None) is not None
+        and getattr(args, "induction_examples", None) is not None
+    ):
+        raise ValueError(
+            "--examples-per-label and --induction-examples are mutually exclusive, got "
+            f"--examples-per-label={args.examples_per_label} and "
+            f"--induction-examples={args.induction_examples}"
+        )
+
     for name, value in (
         ("--examples-per-label", getattr(args, "examples_per_label", None)),
+        ("--induction-examples", getattr(args, "induction_examples", None)),
         ("--max-example-chars", getattr(args, "max_example_chars", None)),
         ("--max-prompt-chars", getattr(args, "max_prompt_chars", None)),
-        ("--induction-retries", getattr(args, "induction_retries", None)),
     ):
         if value is not None and value < 1:
             raise ValueError(f"{name} must be >= 1, got {value}")
@@ -466,6 +483,35 @@ def _validate_args(args: argparse.Namespace) -> None:
     # before any LLM call. Stored on args so _construct_classifiers reuses the
     # exact same resolved list rather than recomputing it a second time.
     args.resolved_classifier_models = _resolve_classifier_models(args)
+
+    # FR-2.1 sizing resolution — one authoritative place, reused by both
+    # run_induction() and the run_config record, so they can never disagree
+    # about which mode actually ran.
+    args.resolved_induction_sizing = _resolve_induction_sizing(args)
+
+
+_DEFAULT_EXAMPLES_PER_LABEL = 20
+
+
+def _resolve_induction_sizing(args: argparse.Namespace) -> tuple[int | None, int | None]:
+    """Resolve --examples-per-label/--induction-examples into the effective
+    ``(examples_per_label, induction_examples)`` pair (FR-2.1). Neither-given
+    resolves to ``(20, None)`` here -- the one place the literal default is
+    applied -- so the ordinary default `induce`/`run` invocation never reaches
+    ``induce()``'s exactly-one-non-None check as ``(None, None)``.
+
+    A `classify`-only run has neither attribute at all (the induction group
+    is not a parent of that subparser) and resolves to ``(None, None)``: there
+    is no induction sizing mode to record for a run that never induces.
+    """
+    if not hasattr(args, "examples_per_label"):
+        return None, None
+    if args.induction_examples is not None:
+        return None, args.induction_examples
+    return (
+        args.examples_per_label if args.examples_per_label is not None else _DEFAULT_EXAMPLES_PER_LABEL,
+        None,
+    )
 
 
 def _resolve_mode(args: argparse.Namespace) -> tuple[bool, bool]:
@@ -602,6 +648,7 @@ def _construct_classifiers(
     will_induce: bool,
     will_classify: bool,
     gateway_kwargs: dict[str, Any] | None = None,
+    n_labels: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Construct every classifier role this invocation needs. Returns
     (classifiers, resolved_model_ids). ``gateway_kwargs`` should be resolved
@@ -636,13 +683,15 @@ def _construct_classifiers(
         return cerebus_model_id(raw) if use_cerebus else raw
 
     if will_induce:
+        if n_labels is None:
+            raise ValueError("n_labels is required when will_induce is True")
         models["induction_model"] = (
             getattr(args, "induction_model", None) or _resolve_single_default_model(args)
         )
         classifiers["induction"] = Classifier(
             model_id=_model_id(models["induction_model"]),
             system_prompt=build_induction_prompt(),
-            classification_model=build_induction_model(),
+            classification_model=build_induction_model(n_labels),
             max_retries=getattr(args, "retries", 3),
             **gateway_kwargs,
         )
@@ -843,10 +892,10 @@ def main() -> None:
         "label_column": args.label_column,
         "category_name": args.category_name,
         "seed": getattr(args, "seed", None),
-        "examples_per_label": getattr(args, "examples_per_label", None),
+        "examples_per_label": args.resolved_induction_sizing[0],
+        "induction_examples": args.resolved_induction_sizing[1],
         "max_example_chars": getattr(args, "max_example_chars", None),
         "max_prompt_chars": getattr(args, "max_prompt_chars", None),
-        "induction_retries": getattr(args, "induction_retries", None),
         "classifier_config": (
             {
                 "critics": args.critics,
@@ -932,8 +981,33 @@ def main() -> None:
         if will_induce:
             stage = "inducing"
             _log_phase("inducing")
+
+            # FR-2.7 preflight, relocated here (ahead of classifier
+            # construction) rather than left solely inside induce(): computing
+            # n_labels for build_induction_model(n_labels) means an
+            # all-filtered train split would otherwise hit
+            # build_induction_model(0)'s generic "n_labels must be >= 1" error
+            # before induce() ever gets to raise FR-2.7's own actionable
+            # message. Raised with FR-2.7's exact wording, still before any
+            # LLM call.
+            if train_df.empty:
+                raise ValueError("train_df is empty after filtering; nothing to induce from")
+            distinct_labels = sorted(train_df[args.label_column].unique().tolist())
+            if len(distinct_labels) == 0:
+                raise ValueError(
+                    f"train_df[{args.label_column!r}] has zero distinct label values; "
+                    "nothing to induce from"
+                )
+            examples_per_label, induction_examples = args.resolved_induction_sizing
+            if induction_examples is not None and induction_examples < len(distinct_labels):
+                raise ValueError(
+                    f"--induction-examples must be >= the number of distinct labels "
+                    f"({len(distinct_labels)}), got {induction_examples}"
+                )
+
             classifiers, models = _construct_classifiers(
-                args, None, will_induce=True, will_classify=False, gateway_kwargs=gateway_kwargs
+                args, None, will_induce=True, will_classify=False,
+                gateway_kwargs=gateway_kwargs, n_labels=len(distinct_labels),
             )
             outcome = run_induction(
                 train_df,
@@ -942,10 +1016,10 @@ def main() -> None:
                 args.category_name,
                 classifiers["induction"],
                 seed=args.seed,
-                examples_per_label=args.examples_per_label,
+                examples_per_label=examples_per_label,
+                induction_examples=induction_examples,
                 max_example_chars=args.max_example_chars,
                 max_prompt_chars=args.max_prompt_chars,
-                max_reconciliation_retries=args.induction_retries,
             )
             (run_dir / "train.csv").write_text(train_df.to_csv(index=False))
             (run_dir / "induction_prompt.txt").write_text(outcome.rendered_prompt)

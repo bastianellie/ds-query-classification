@@ -329,15 +329,25 @@ def test_project_and_filter_label_only_dropped_for_train_role():
 
 
 class FakeInductionClassifier:
-    def __init__(self, response=None, error=None, responses=None):
+    def __init__(self, response=None, error=None, responses=None, n_labels=None):
         # ``responses`` (a list) is consumed one per call, in order -- for
-        # testing induce()'s reconciliation-mismatch retry, where successive
-        # calls need to return different label sets. ``response`` (singular)
-        # keeps returning the same value every call, for everything else.
+        # tests that need successive calls to return different responses.
+        # ``response`` (singular) keeps returning the same value every call,
+        # for everything else.
         self.response = response
         self.error = error
         self.responses = responses
         self.calls = []
+        # A real Classifier always exposes ``classification_model`` (the
+        # schema it was built with) -- induce()'s arity guard reads it, so
+        # this fake must too. Inferred from the response's own
+        # ``description_i`` keys when not given explicitly, so the ~15
+        # existing call sites in this file don't all need an explicit
+        # ``n_labels=`` just to satisfy the guard.
+        if n_labels is None:
+            sample = (responses[0] if responses else response) or {}
+            n_labels = sum(1 for k in sample if k.startswith("description_")) or None
+        self.classification_model = build_induction_model(n_labels) if n_labels else None
 
     def classify(self, text):
         self.calls.append(text)
@@ -349,9 +359,14 @@ class FakeInductionClassifier:
 
 
 def _induction_response(labels):
+    """Build a positional induction response for ``len(labels)`` labels.
+    ``labels`` only determines the count and each description's readable
+    content -- position, not label identity, is what induce() actually maps
+    by (AR-2.1); pass labels already in sorted order when a test cares about
+    which description lands on which label."""
     return {
         "category_description": "desc",
-        "labels": [{"label": lbl, "description": f"{lbl} desc"} for lbl in labels],
+        **{f"description_{i}": f"{lbl} desc" for i, lbl in enumerate(labels, start=1)},
     }
 
 
@@ -401,6 +416,20 @@ def test_induce_rng_exact_sequence():
     assert outcome2.sampled_examples == outcome.sampled_examples
 
 
+def test_induce_below_cap_label_contributes_all_its_examples():
+    # A label with FEWER examples than --examples-per-label's cap must
+    # contribute exactly all of them, in stable source order -- not just the
+    # at-or-above-cap cases test_induce_rng_exact_sequence already covers.
+    df = _train_df([("p1", "pos"), ("p2", "pos"), ("p3", "pos"), ("n1", "neg")])
+    classifier = FakeInductionClassifier(response=_induction_response(["neg", "pos"]))
+    outcome = induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, examples_per_label=20, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    assert len(outcome.sampled_examples["pos"]) == 3
+    assert [e["position"] for e in outcome.sampled_examples["pos"]] == [0, 1, 2]
+
+
 def test_induce_at_cap_label_consumes_no_rng_state():
     # Growing an over-cap label's pool must not perturb an at-or-below-cap
     # label's own selection.
@@ -415,6 +444,170 @@ def test_induce_at_cap_label_consumes_no_rng_state():
         )
         neu_idx = [i for i, r in enumerate(rows) if r[1] == "neu"]
         assert [e["position"] for e in outcome.sampled_examples["neu"]] == neu_idx
+
+
+# --- FR-2.1: --induction-examples total-budget sizing mode -----------------
+
+
+def test_induce_requires_exactly_one_sizing_mode():
+    df = _train_df([("a", "pos"), ("b", "neg")])
+    classifier = FakeInductionClassifier(response=_induction_response(["pos", "neg"]))
+    with pytest.raises(ValueError, match="examples_per_label"):
+        induce(
+            df, "text", "label", "cat", classifier,
+            seed=0, max_example_chars=100, max_prompt_chars=100_000,
+        )
+    assert classifier.calls == []
+    with pytest.raises(ValueError, match="examples_per_label"):
+        induce(
+            df, "text", "label", "cat", classifier,
+            seed=0, examples_per_label=5, induction_examples=10,
+            max_example_chars=100, max_prompt_chars=100_000,
+        )
+    assert classifier.calls == []
+
+
+def test_induce_budget_quotas_sum_to_exactly_n_largest_remainder():
+    rows = [(f"a{i}", "a") for i in range(999)] + [(f"b{i}", "b") for i in range(999)] + [
+        (f"c{i}", "c") for i in range(999)
+    ]
+    df = _train_df(rows)
+    classifier = FakeInductionClassifier(response=_induction_response(["a", "b", "c"]))
+    outcome = induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, induction_examples=100, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    quotas = {label: len(entries) for label, entries in outcome.sampled_examples.items()}
+    assert quotas == {"a": 34, "b": 33, "c": 33}
+    assert sum(quotas.values()) == 100
+
+
+def test_induce_budget_n_equals_n_labels_gives_every_label_one():
+    df = _train_df([("a1", "a"), ("b1", "b"), ("c1", "c")])
+    classifier = FakeInductionClassifier(response=_induction_response(["a", "b", "c"]))
+    outcome = induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, induction_examples=3, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    quotas = {label: len(entries) for label, entries in outcome.sampled_examples.items()}
+    assert quotas == {"a": 1, "b": 1, "c": 1}
+
+
+def test_induce_budget_redistributes_shortfall_to_labels_with_spare_rows():
+    # "a" has only 2 usable rows; a budget of 10 over 3 labels must still
+    # select 10 in total, with the freed 8 slots re-divided among "b"/"c".
+    rows = [("a0", "a"), ("a1", "a")] + [(f"b{i}", "b") for i in range(999)] + [
+        (f"c{i}", "c") for i in range(999)
+    ]
+    df = _train_df(rows)
+    classifier = FakeInductionClassifier(response=_induction_response(["a", "b", "c"]))
+    outcome = induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, induction_examples=10, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    quotas = {label: len(entries) for label, entries in outcome.sampled_examples.items()}
+    assert quotas["a"] == 2
+    assert sum(quotas.values()) == 10
+
+
+def test_induce_budget_cascading_shortfall_across_multiple_scarce_labels():
+    rows = [("a0", "a")] + [("b0", "b"), ("b1", "b")] + [(f"c{i}", "c") for i in range(999)]
+    df = _train_df(rows)
+    classifier = FakeInductionClassifier(response=_induction_response(["a", "b", "c"]))
+    outcome = induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, induction_examples=20, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    quotas = {label: len(entries) for label, entries in outcome.sampled_examples.items()}
+    assert quotas == {"a": 1, "b": 2, "c": 17}
+
+
+def test_induce_budget_all_labels_scarce_sums_to_available_rows():
+    df = _train_df([("a0", "a"), ("a1", "a"), ("b0", "b"), ("b1", "b"), ("b2", "b"),
+                     ("c0", "c"), ("c1", "c"), ("c2", "c"), ("c3", "c")])
+    classifier = FakeInductionClassifier(response=_induction_response(["a", "b", "c"]))
+    outcome = induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, induction_examples=100, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    quotas = {label: len(entries) for label, entries in outcome.sampled_examples.items()}
+    assert quotas == {"a": 2, "b": 3, "c": 4}
+
+
+def test_induce_budget_below_label_count_rejected_with_zero_calls():
+    df = _train_df([("a", "x"), ("b", "y"), ("c", "z")])
+    classifier = FakeInductionClassifier(response=_induction_response(["x", "y", "z"]))
+    with pytest.raises(ValueError, match="induction-examples"):
+        induce(
+            df, "text", "label", "cat", classifier,
+            seed=0, induction_examples=2, max_example_chars=100, max_prompt_chars=100_000,
+        )
+    assert classifier.calls == []
+
+
+def test_induce_budget_mode_is_seed_deterministic_but_not_cross_label_independent():
+    rows_a = [(f"a{i}", "a") for i in range(10)] + [(f"b{i}", "b") for i in range(10)]
+    rows_b = [(f"a{i}", "a") for i in range(20)] + [(f"b{i}", "b") for i in range(10)]
+
+    def _positions(rows, seed=3):
+        df = _train_df(rows)
+        classifier = FakeInductionClassifier(response=_induction_response(["a", "b"]))
+        outcome = induce(
+            df, "text", "label", "cat", classifier,
+            seed=seed, induction_examples=8, max_example_chars=100, max_prompt_chars=100_000,
+        )
+        return {lbl: [e["position"] for e in entries] for lbl, entries in outcome.sampled_examples.items()}
+
+    # Determinism: same seed/split/flags -> identical example set.
+    assert _positions(rows_a) == _positions(rows_a)
+    # NOT cross-label independent (unlike --examples-per-label): growing "a"'s
+    # pool changes "b"'s own quota/selection too, since quotas are computed
+    # jointly. This is the guarantee --induction-examples explicitly gives up.
+    assert _positions(rows_a)["b"] != _positions(rows_b)["b"]
+
+
+# --- AR-2.1's arity guard (internal defensive check, spec 2 Spec Deviations #2) --
+
+
+def test_induce_arity_guard_passes_for_a_correctly_sized_model():
+    df = _train_df([("a", "pos"), ("b", "neg"), ("c", "neu")])
+    classifier = FakeInductionClassifier(response=_induction_response(["pos", "neg", "neu"]), n_labels=3)
+    outcome = induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    assert len(outcome.category.labels) == 3
+
+
+def test_induce_arity_guard_rejects_a_wrong_sized_model():
+    # Only this direction actually proves the guard uses an exact field-set
+    # comparison, not a substring/count check that would also match
+    # "category_description" itself (verified live: a naive "description" in
+    # name predicate counts 4 fields for a 3-label model).
+    df = _train_df([("a", "pos"), ("b", "neg"), ("c", "neu")])
+    classifier = FakeInductionClassifier(response=_induction_response(["pos", "neg"]), n_labels=2)
+    with pytest.raises(ValueError, match="internal inconsistency|expected"):
+        induce(
+            df, "text", "label", "cat", classifier,
+            seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
+        )
+    assert classifier.calls == []
+
+
+def test_induce_positional_mapping_survives_out_of_order_completion_risk():
+    """Distinguishable per-position descriptions must land on the correctly
+    SORTED label, not the order labels happened to appear in the source
+    rows -- this is what would catch an off-by-one or an accidental re-sort."""
+    df = _train_df([("z1", "zeta"), ("a1", "alpha"), ("m1", "mu")])  # source order != sorted order
+    classifier = FakeInductionClassifier(
+        response={"category_description": "d", "description_1": "D-ALPHA", "description_2": "D-MU", "description_3": "D-ZETA"}
+    )
+    outcome = induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    by_value = {lbl.value: lbl.description for lbl in outcome.category.labels}
+    assert by_value == {"alpha": "D-ALPHA", "mu": "D-MU", "zeta": "D-ZETA"}
 
 
 def test_induce_truncation_marker():
@@ -440,89 +633,6 @@ def test_induce_prompt_size_preflight():
     assert classifier.calls == []  # zero calls before the preflight check
 
 
-def test_induce_rejects_missing_or_invented_labels():
-    df = _train_df([("a", "pos"), ("b", "neg")])
-    classifier = FakeInductionClassifier(response=_induction_response(["pos", "invented"]))
-    with pytest.raises(ValueError, match="missing|unexpected"):
-        induce(
-            df, "text", "label", "cat", classifier,
-            seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
-        )
-
-
-def test_induce_retries_reconciliation_mismatch_then_succeeds():
-    # First two calls omit "neg" (a plausible one-off LLM slip); the third
-    # returns the complete label set -- induce() must retry and succeed
-    # rather than raising on the first mismatch.
-    df = _train_df([("a", "pos"), ("b", "neg")])
-    classifier = FakeInductionClassifier(
-        responses=[
-            _induction_response(["pos"]),
-            _induction_response(["pos"]),
-            _induction_response(["pos", "neg"]),
-        ]
-    )
-    outcome = induce(
-        df, "text", "label", "cat", classifier,
-        seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
-        max_reconciliation_retries=3,
-    )
-    assert len(classifier.calls) == 3
-    assert {lbl.value for lbl in outcome.category.labels} == {"pos", "neg"}
-    # Every retry re-sends the identical prompt -- only the mismatch itself
-    # is retried, not the sampling/prompt-building step.
-    assert classifier.calls[0] == classifier.calls[1] == classifier.calls[2]
-
-
-def test_induce_exhausts_reconciliation_retries_then_raises():
-    df = _train_df([("a", "pos"), ("b", "neg")])
-    classifier = FakeInductionClassifier(response=_induction_response(["pos"]))
-    with pytest.raises(ValueError, match="missing"):
-        induce(
-            df, "text", "label", "cat", classifier,
-            seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
-            max_reconciliation_retries=3,
-        )
-    assert len(classifier.calls) == 3  # exhausted every attempt, not just one
-
-
-def test_induce_reconciliation_retries_must_be_at_least_one():
-    df = _train_df([("a", "pos"), ("b", "neg")])
-    classifier = FakeInductionClassifier(response=_induction_response(["pos", "neg"]))
-    with pytest.raises(ValueError, match="max_reconciliation_retries"):
-        induce(
-            df, "text", "label", "cat", classifier,
-            seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
-            max_reconciliation_retries=0,
-        )
-    assert classifier.calls == []  # rejected before any call, like the other pre-call checks
-
-
-def test_induce_reconciliation_retry_does_not_mask_a_call_failure():
-    # A genuine classifier-call failure (not a reconciliation mismatch) must
-    # still propagate immediately as RuntimeError, not get treated as a
-    # retryable mismatch.
-    df = _train_df([("a", "pos"), ("b", "neg")])
-    classifier = FakeInductionClassifier(error=RuntimeError("boom"))
-    with pytest.raises(RuntimeError, match="induction call failed"):
-        induce(
-            df, "text", "label", "cat", classifier,
-            seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
-            max_reconciliation_retries=3,
-        )
-    assert len(classifier.calls) == 1  # not retried at this level
-
-
-def test_induce_rejects_duplicate_label():
-    df = _train_df([("a", "pos"), ("b", "neg")])
-    classifier = FakeInductionClassifier(response=_induction_response(["pos", "pos", "neg"]))
-    with pytest.raises(ValueError, match="duplicate"):
-        induce(
-            df, "text", "label", "cat", classifier,
-            seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
-        )
-
-
 @pytest.mark.parametrize("bad_label", ["none", "NONE", "  none  ", "none - foo", "None - Bar"])
 def test_induce_rejects_reserved_sentinel(bad_label):
     df = _train_df([("a", bad_label), ("b", "other")])
@@ -537,7 +647,7 @@ def test_induce_rejects_reserved_sentinel(bad_label):
 
 def test_induce_sanitizes_failure():
     df = _train_df([("a", "pos"), ("b", "neg")])
-    classifier = FakeInductionClassifier(error=RuntimeError("secret-token=abc123"))
+    classifier = FakeInductionClassifier(error=RuntimeError("secret-token=abc123"), n_labels=2)
     with pytest.raises(RuntimeError) as exc_info:
         induce(
             df, "text", "label", "cat", classifier,
@@ -577,6 +687,14 @@ def test_induce_category_round_trips():
     assert Category.model_validate(outcome.category.model_dump()) == outcome.category
 
 
+def _parse_induction_payload(sent):
+    from query_classification.induction import _DATA_END, _DATA_START
+
+    start = sent.index(_DATA_START) + len(_DATA_START)
+    end = sent.index(_DATA_END)
+    return json.loads(sent[start:end])
+
+
 def test_induce_single_call_sees_all_labels_grouped():
     df = _train_df([("a1", "neg"), ("a2", "neg"), ("b1", "neu"), ("c1", "pos"), ("c2", "pos")])
     classifier = FakeInductionClassifier(response=_induction_response(["neg", "neu", "pos"]))
@@ -590,25 +708,89 @@ def test_induce_single_call_sees_all_labels_grouped():
         assert f'"{label}"' in sent
 
 
+def test_induce_payload_is_an_ordered_positional_array_not_an_object():
+    """Direct Verify condition for FR-2.2/AR-2.2: the request payload must be
+    an array with explicit 1-based positions in sorted-label order, not an
+    object keyed by label value -- an implementation that merely preserves
+    dict insertion order would pass every other test in this file but fail
+    this one."""
+    df = _train_df([("a1", "neg"), ("a2", "neg"), ("b1", "neu"), ("c1", "pos"), ("c2", "pos")])
+    classifier = FakeInductionClassifier(response=_induction_response(["neg", "neu", "pos"]))
+    induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
+    )
+    payload = _parse_induction_payload(classifier.calls[0])
+    assert isinstance(payload["labels"], list)
+    assert [entry["label"] for entry in payload["labels"]] == ["neg", "neu", "pos"]
+    assert [entry["position"] for entry in payload["labels"]] == [1, 2, 3]
+    for entry in payload["labels"]:
+        assert entry["examples"], f"label {entry['label']!r} has no examples"
+
+
 # ---------------------------------------------------------------------------
 # schema.py / prompts.py additions
 # ---------------------------------------------------------------------------
 
 
-def test_build_induction_model_list_shape_not_dynamic_field():
-    model = build_induction_model()
-    validated = model.model_validate(
-        {"category_description": "d", "labels": [{"label": "class 1", "description": "x"}]}
-    )
-    assert validated.labels[0].label == "class 1"
+def test_build_induction_model_positional_required_fields():
+    for n in (1, 3):
+        model = build_induction_model(n)
+        expected_fields = {"category_description"} | {f"description_{i}" for i in range(1, n + 1)}
+        assert set(model.model_fields) == expected_fields
+        payload = {"category_description": "d", **{f"description_{i}": f"d{i}" for i in range(1, n + 1)}}
+        validated = model.model_validate(payload)
+        assert validated.description_1 == "d1"
+
+
+def test_build_induction_model_rejects_short_response():
+    model = build_induction_model(3)
     with pytest.raises(Exception):
-        model.model_validate({"category_description": "d", "labels": [{"label": "x"}]})
+        model.model_validate(
+            {"category_description": "d", "description_1": "d1", "description_2": "d2"}
+        )
+
+
+def test_build_induction_model_rejects_zero_labels():
+    with pytest.raises(ValueError, match="n_labels"):
+        build_induction_model(0)
+
+
+def test_build_induction_model_serialization_stays_strict_compatible():
+    """Regression guard for AR-2.1's design choice: required positional fields,
+    not a length-bounded list. Cannot prove PROVIDER rejection of a bounded
+    list (that would need a live call) -- only that the local schema keeps
+    the shape verified against the installed litellm/pydantic stack: strict
+    mode, every description field required, and no minItems/maxItems (which
+    strict structured output does not support and would silently degrade
+    every induction call to JSON-object-mode fallback)."""
+    from litellm.utils import type_to_response_format_param
+
+    model = build_induction_model(3)
+    serialized = type_to_response_format_param(model)
+    schema = serialized["json_schema"]
+    assert serialized["json_schema"]["strict"] is True
+    required = schema["schema"]["required"]
+    assert {"category_description", "description_1", "description_2", "description_3"} == set(required)
+    assert "minItems" not in json.dumps(schema)
+    assert "maxItems" not in json.dumps(schema)
 
 
 def test_build_induction_prompt_non_empty_no_placeholders():
     text = build_induction_prompt()
     assert text.strip()
     assert "{" not in text or "}" not in text.replace("{{", "").replace("}}", "")
+
+
+def test_build_induction_prompt_states_positional_contract_not_label_echo():
+    """Regression guard for the risk that the schema changes but the prompt
+    doesn't: Classifier falls back to JSON-object mode when structured output
+    is unavailable, and in that mode the prompt text is the ONLY statement of
+    the description_i field names -- a stale prompt would silently break only
+    against a live provider, invisible to every offline test."""
+    text = build_induction_prompt()
+    assert "description_" in text
+    assert "exact name" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -625,14 +807,10 @@ def fake_classify(monkeypatch):
     def _classify(self, text):
         log["calls"] += 1
         fields = set(self.classification_model.model_fields.keys())
-        if fields == {"category_description", "labels"}:
-            return {
-                "category_description": "desc",
-                "labels": [
-                    {"label": "negative", "description": "d"},
-                    {"label": "positive", "description": "d"},
-                ],
-            }
+        if "category_description" in fields:
+            # Induction role (spec 2's positional description_i fields, one
+            # per label position -- variable count, no fixed field set).
+            return {f: "d" for f in fields}
         if fields == {"challenges", "proposed_label", "argument"}:
             return {"challenges": False, "proposed_label": None, "argument": "no challenge"}
         if fields == {"labels", "reasoning"}:
@@ -732,6 +910,12 @@ def test_run_end_to_end(tmp_path, fake_classify):
     assert config["status"] == "completed"
     assert config["categories_source"] == "induced"
     assert config["label_values"] == ["negative", "positive"]
+    # Default invocation (neither sizing flag given) must still work and
+    # record the resolved literal default -- proves _resolve_induction_sizing
+    # doesn't leave the ordinary default path passing (None, None) into
+    # induce()'s exactly-one-non-None check.
+    assert config["examples_per_label"] == 20
+    assert config["induction_examples"] is None
 
 
 def test_induce_subcommand_writes_categories_only(tmp_path, fake_classify):
@@ -745,6 +929,71 @@ def test_induce_subcommand_writes_categories_only(tmp_path, fake_classify):
     assert (run_dir / "categories.json").exists()
     assert not (run_dir / "test_classified.csv").exists()
     assert fake_classify["calls"] == 1  # only the induction call, zero classification calls
+
+
+def test_induce_budget_mode_end_to_end_writes_valid_categories(tmp_path, fake_classify):
+    train = _write_csv(
+        tmp_path / "train.csv",
+        [("a1", "positive"), ("a2", "positive"), ("b1", "negative"), ("b2", "negative")],
+        ["text", "label"],
+    )
+    run_dir = tmp_path / "runind_budget"
+    code = _run_main(
+        ["induce", "--train-file", str(train), "--text-column", "text",
+         "--label-column", "label", "--category-name", "sentiment", "--run-dir", str(run_dir),
+         "--induction-examples", "4"]
+    )
+    assert code in (0, None)
+    from query_classification.categories import load_categories
+
+    cats = load_categories(run_dir / "categories.json")
+    assert {lbl.value for lbl in cats[0].labels} == {"positive", "negative"}
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["examples_per_label"] is None
+    assert config["induction_examples"] == 4
+
+
+def test_induce_examples_flags_mutually_exclusive(tmp_path, fake_classify):
+    train = _write_csv(tmp_path / "train.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    code = _run_main(
+        ["induce", "--train-file", str(train), "--text-column", "text",
+         "--label-column", "label", "--category-name", "sentiment", "--run-dir", str(tmp_path / "r"),
+         "--examples-per-label", "5", "--induction-examples", "10"]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+def test_induce_budget_below_label_count_rejected(tmp_path, fake_classify):
+    train = _write_csv(
+        tmp_path / "train.csv",
+        [("a", "positive"), ("b", "negative"), ("c", "neutral")],
+        ["text", "label"],
+    )
+    code = _run_main(
+        ["induce", "--train-file", str(train), "--text-column", "text",
+         "--label-column", "label", "--category-name", "sentiment", "--run-dir", str(tmp_path / "r"),
+         "--induction-examples", "2"]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+
+
+def test_induce_all_rows_filtered_reports_fr_2_7_error_not_arity_error(tmp_path, fake_classify, capsys):
+    """Regression guard: computing n_labels ahead of build_induction_model
+    must not let a generic "n_labels must be >= 1" error preempt FR-2.7's own
+    actionable "train_df is empty after filtering" message for an
+    all-rows-filtered train split."""
+    train = _write_csv(tmp_path / "train.csv", [("", "positive"), ("   ", "negative")], ["text", "label"])
+    code = _run_main(
+        ["induce", "--train-file", str(train), "--text-column", "text",
+         "--label-column", "label", "--category-name", "sentiment", "--run-dir", str(tmp_path / "r")]
+    )
+    assert code == 1
+    assert fake_classify["calls"] == 0
+    out = capsys.readouterr().out
+    assert "empty" in out
+    assert "n_labels" not in out
 
 
 def test_classify_rejects_multi_category_file(tmp_path, fake_classify):
@@ -1194,7 +1443,7 @@ def test_models_end_to_end_run_config(tmp_path, fake_classify):
     )
     assert code in (0, None)
     config = json.loads((run_dir / "run_config.json").read_text())
-    assert config["schema_version"] == 3
+    assert config["schema_version"] == 4
     assert config["models"]["classification_models"] == ["a", "b"]
     assert config["models"]["model"] is None
     assert set(config["models"]["model_failure_counts"].keys()) == {"a", "b"}
@@ -1220,6 +1469,10 @@ def test_models_non_models_run_has_null_keys(tmp_path, fake_classify):
     assert "classification_models" in models_cfg and models_cfg["classification_models"] is None
     assert "model_failure_counts" in models_cfg and models_cfg["model_failure_counts"] is None
     assert models_cfg["model"] is not None
+    # `classify` has neither induction flag at all (not a parent of that
+    # subparser) -- both sizing keys must be null, not the per-label default.
+    assert config["examples_per_label"] is None
+    assert config["induction_examples"] is None
 
 
 def test_models_run_with_induction_merges_all_fields(tmp_path, fake_classify):

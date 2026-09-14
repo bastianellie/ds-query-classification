@@ -494,8 +494,10 @@ def recorded_classifier_inits(monkeypatch):
         fields = set(self.classification_model.model_fields.keys())
         if fields == {"challenges", "proposed_label", "argument"}:
             return {"challenges": False, "proposed_label": None, "argument": "no challenge"}
-        if fields == {"category_description", "labels"}:
-            return {"category_description": "desc", "labels": [{"label": "x", "description": "d"}]}
+        if "category_description" in fields:
+            # Induction role (spec 2's positional description_i fields, one
+            # per label position -- variable count, no fixed field set).
+            return {f: "d" for f in fields}
         cat_name = next(iter(fields))
         return {cat_name: ["x"]}
 

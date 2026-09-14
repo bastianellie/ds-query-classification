@@ -23,9 +23,19 @@
 #   experiments/trec/run_experiment.sh --critics --sampling-runs 3
 #
 # Env overrides (all optional):
-#   SEED (default 42), EXAMPLES_PER_LABEL (default 20)
+#   SEED (default 42)
+#   EXAMPLES_PER_LABEL (default 20) -- per-label sampling cap. Mutually
+#   exclusive with INDUCTION_EXAMPLES (and with a trailing --induction-examples
+#   flag); set it to an empty string (EXAMPLES_PER_LABEL=) to suppress the
+#   default when passing --induction-examples as a trailing flag instead.
+#   INDUCTION_EXAMPLES (unset by default) -- total example budget across all
+#   labels instead of a per-label cap, e.g. INDUCTION_EXAMPLES=60. Overrides
+#   EXAMPLES_PER_LABEL when set.
 #   TEST_LIMIT (unset by default -> classifies the entire 500-row test split;
 #   set it to a small number for a cheap smoke test, e.g. TEST_LIMIT=40)
+#   DRY_RUN=1 -- print the assembled experiment.py argv instead of running it
+#   (no provider call, no `datasets` package required); useful for checking
+#   which sizing mode would actually be sent.
 
 set -euo pipefail
 
@@ -35,12 +45,17 @@ EXPERIMENT_DIR="$SCRIPT_DIR"
 RUN_DIR="$EXPERIMENT_DIR/runs/$(date +%Y%m%d-%H%M%S)"
 
 SEED="${SEED:-42}"
-EXAMPLES_PER_LABEL="${EXAMPLES_PER_LABEL:-20}"
+# No-colon form: an EXPLICITLY empty value (EXAMPLES_PER_LABEL=) must stay
+# empty, not collapse back to 20 -- that's how a caller suppresses the
+# default when switching to --induction-examples/INDUCTION_EXAMPLES instead.
+EXAMPLES_PER_LABEL="${EXAMPLES_PER_LABEL-20}"
+INDUCTION_EXAMPLES="${INDUCTION_EXAMPLES:-}"
 TEST_LIMIT="${TEST_LIMIT:-}"
+DRY_RUN="${DRY_RUN:-}"
 
 cd "$REPO_ROOT"
 
-if ! .venv/bin/python -c "import datasets" >/dev/null 2>&1; then
+if [ -z "$DRY_RUN" ] && ! .venv/bin/python -c "import datasets" >/dev/null 2>&1; then
   echo "The 'datasets' package is required for --hf-dataset. Install it with:" >&2
   echo "  .venv/bin/pip install -e '.[hf]'" >&2
   exit 1
@@ -63,10 +78,32 @@ ARGS=(
   --critics --critic-model @sciencedirect-global-openai/gpt-5.4-2026-03-05 --reconciler-model @sciencedirect-global-openai/gpt-5.4-2026-03-05
   --run-dir "$RUN_DIR"
   --seed "$SEED"
-  --examples-per-label "$EXAMPLES_PER_LABEL"
 )
+# --examples-per-label/--induction-examples are mutually exclusive
+# (experiment.py's FR-2.1) -- only add the default per-label cap when no
+# budget mode is already in effect, either via INDUCTION_EXAMPLES or a
+# trailing --induction-examples flag passed directly in "$@".
+induction_examples_in_passthrough=0
+for arg in "$@"; do
+  if [ "$arg" = "--induction-examples" ]; then
+    induction_examples_in_passthrough=1
+    break
+  fi
+done
+
+if [ -n "$INDUCTION_EXAMPLES" ]; then
+  ARGS+=(--induction-examples "$INDUCTION_EXAMPLES")
+elif [ "$induction_examples_in_passthrough" -eq 0 ] && [ -n "$EXAMPLES_PER_LABEL" ]; then
+  ARGS+=(--examples-per-label "$EXAMPLES_PER_LABEL")
+fi
+
 if [ -n "$TEST_LIMIT" ]; then
   ARGS+=(--test-limit "$TEST_LIMIT")
+fi
+
+if [ -n "$DRY_RUN" ]; then
+  echo "Would run: experiment.py run $(printf '%q ' "${ARGS[@]}" "$@")"
+  exit 0
 fi
 
 .venv/bin/python experiment.py run "${ARGS[@]}" "$@"

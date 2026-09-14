@@ -43,6 +43,16 @@ Override scale via env vars: `SEED`, `EXAMPLES_PER_LABEL`, `TEST_LIMIT`. Set
 a cheap smoke test of the loop instead of a full, costlier run — especially
 relevant with `--critics`, which multiplies LLM call volume per row.
 
+By default induction samples up to `EXAMPLES_PER_LABEL` (20) examples per
+label. For a total example *budget* across all labels instead (mutually
+exclusive with `EXAMPLES_PER_LABEL` — set `EXAMPLES_PER_LABEL=` to an empty
+string, or pass `--induction-examples` as a trailing flag, which
+automatically suppresses the default cap), use `INDUCTION_EXAMPLES`, e.g.
+`INDUCTION_EXAMPLES=60 experiments/trec/run_experiment.sh`. Set
+`DRY_RUN=1` to print the assembled `experiment.py` invocation instead of
+running it — no provider call, no `datasets` package required — to check
+which sizing mode would actually be sent.
+
 ## Output
 
 Each run writes a fresh, timestamped directory under `runs/`

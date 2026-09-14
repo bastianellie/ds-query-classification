@@ -22,7 +22,9 @@ Rules:
   of the label name.
 - Keep each description brief: a sentence or two is enough.
 
-Respond with a valid JSON object matching the required schema: a "category_description"
-string, and a "labels" array with one entry per label, each entry containing that
-label's exact name and its description. Do not add any explanation outside the JSON
-object.
+You will be given the labels in a fixed, numbered order. Respond with a valid JSON
+object matching the required schema: a "category_description" string, plus one
+description field per label, named by its position in that order ("description_1" for
+the first label shown, "description_2" for the second, and so on) -- one description
+field per label shown, in that same order, and nothing else. Do not add any explanation
+outside the JSON object.
