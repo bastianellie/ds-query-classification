@@ -3,6 +3,10 @@
 > **Status: CLOSED** — Implemented and verified on 2026-09-08.
 > Implementation summary: `spec/2-experiment-runner/implementation-summary.md`
 > Merged from worktree branch `spec/2-experiment-runner` on 2026-09-08.
+> **Reopened and re-closed 2026-09-14** for the induction pipeline redesign (positional
+> description contract + `--induction-examples` total-budget sampling) — see the Change
+> Log's final entry and `implementation-summary.md`'s appended 2026-09-14 section.
+> Re-merged from worktree branch `spec/2-experiment-runner` on 2026-09-14.
 
 ## Overview
 
