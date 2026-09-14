@@ -189,6 +189,18 @@ def build_parser() -> argparse.ArgumentParser:
     induction.add_argument(
         "--induction-model", metavar="MODEL", help="LiteLLM model id for induction; defaults to --model"
     )
+    induction.add_argument(
+        "--induction-retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Retry attempts if the induction response's label set doesn't match the "
+        "dataset's labels (missing or invented entries) -- a plausible one-off LLM "
+        "slip, not necessarily systemic, more likely with a larger --examples-per-label "
+        "or label count (default: 3). Each retry re-sends the identical prompt; only "
+        "the induction model's own non-zero temperature gives it a chance at a "
+        "different response.",
+    )
 
     classification = argparse.ArgumentParser(add_help=False)
     classification.add_argument("--api-base", metavar="URL", help="Override the API endpoint/base URL")
@@ -426,6 +438,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         ("--examples-per-label", getattr(args, "examples_per_label", None)),
         ("--max-example-chars", getattr(args, "max_example_chars", None)),
         ("--max-prompt-chars", getattr(args, "max_prompt_chars", None)),
+        ("--induction-retries", getattr(args, "induction_retries", None)),
     ):
         if value is not None and value < 1:
             raise ValueError(f"{name} must be >= 1, got {value}")
@@ -833,6 +846,7 @@ def main() -> None:
         "examples_per_label": getattr(args, "examples_per_label", None),
         "max_example_chars": getattr(args, "max_example_chars", None),
         "max_prompt_chars": getattr(args, "max_prompt_chars", None),
+        "induction_retries": getattr(args, "induction_retries", None),
         "classifier_config": (
             {
                 "critics": args.critics,
@@ -931,6 +945,7 @@ def main() -> None:
                 examples_per_label=args.examples_per_label,
                 max_example_chars=args.max_example_chars,
                 max_prompt_chars=args.max_prompt_chars,
+                max_reconciliation_retries=args.induction_retries,
             )
             (run_dir / "train.csv").write_text(train_df.to_csv(index=False))
             (run_dir / "induction_prompt.txt").write_text(outcome.rendered_prompt)

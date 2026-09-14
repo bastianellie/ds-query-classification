@@ -227,48 +227,98 @@ say what each label means *and* what distinguishes it from the others.
 
 ### Functional Requirements
 
-#### FR-2.1: Seeded per-label example sampling with a cap
+#### FR-2.1: Seeded example sampling, sized by either a per-label cap or a total budget
 Examples are grouped by their (normalized, FR-1.3) label value, with labels processed in
-**sorted** order. Each label contributes up to `--examples-per-label` (default 50)
-examples, selected by a **single named, seeded generator** (`random.Random(seed)`) over the
-label's stable post-filter row positions — pinned because `random`, NumPy, and
-`DataFrame.sample` select different rows for the same seed, and an unpinned choice would
-make the recorded seed meaningless across implementations or dependency bumps. A label with
-fewer than the cap contributes all of its examples, in source order. `--seed` (default 0)
-and the cap are recorded in the run config.
+**sorted** order, and selected by a **single named, seeded generator**
+(`random.Random(seed)`, `--seed` default 0) over each label's stable post-filter row
+positions — pinned because `random`, NumPy, and `DataFrame.sample` select different rows
+for the same seed, and an unpinned choice would make the recorded seed meaningless across
+implementations or dependency bumps.
+
+The sample size is set by exactly one of two **mutually exclusive** flags. Supplying both
+is an error naming both, raised before any LLM call; supplying neither means
+`--examples-per-label`'s default. The mutual-exclusion check must distinguish *explicitly
+passed* from *left at its default* — a per-label flag that defaults to `20` outright would
+collide with every `--induction-examples` invocation — so `--examples-per-label`'s argparse
+default becomes `None` and the literal `20` is applied during resolution, the same mechanic
+spec 4's AR-1.8 required of `--model`:
+
+- **`--examples-per-label N`** (default 20) — each label contributes up to `N` examples;
+  a label with fewer than `N` usable rows contributes all of them, in source order. Total
+  prompt volume scales with the label count (`labels × N`).
+- **`--induction-examples N`** (no default) — `N` examples **in total**, spread as evenly
+  as possible across labels, so prompt volume is bounded by `N` no matter how many labels
+  the dataset has. Quotas are assigned by **largest remainder**: every label gets
+  `N // n_labels`, then the `N % n_labels` leftover slots go one each to the labels with
+  the largest fractional part, ties broken by sorted label value. Quotas therefore always
+  sum to exactly `N` and are fully determined by `(N, sorted label values)` — e.g. `N=100`
+  over 3 labels yields 34/33/33. A label with fewer usable rows than its quota contributes
+  all of them, and the freed slots are re-divided by the same rule among labels that still
+  have unused rows, repeating until either `N` is reached or no label has spare rows — so
+  the budget is met whenever the data allows.
+
+`--induction-examples N` must be at least the number of distinct labels, otherwise some
+label's quota would be 0 and that label would have no examples to describe from. A smaller
+`N` is an error naming both `N` and the label count. This is a data-dependent check, so it
+is raised once the label set is known but still before any LLM call, alongside FR-2.7's
+related zero-usable-examples checks.
+
+**Reproducibility:** in both modes, the same `--seed`, train split, and flags select an
+identical example set. The modes differ in one guarantee, and only the per-label cap keeps
+it: under `--examples-per-label`, a label's selection is independent of every other
+label's row count (a label at or below the cap consumes no generator state at all); under
+`--induction-examples`, quotas depend on the other labels' row counts by construction, so
+adding rows to one label can change another label's sample. `--seed` and the **effective**
+sizing values are recorded in the run config — the mode that actually ran, so on an
+inducing run exactly one of `examples_per_label`/`induction_examples` is non-null there
+(per-label mode records the resolved cap, including the literal default, rather than the
+`None` argparse saw). A `classify`-only run records both as null, since the induction flag
+group does not exist on that subcommand.
 **Verify:** two induction runs over the same train split with the same `--seed` select an
-identical example set (assert on the examples embedded in the prompt sent to a fake
-classifier); for a label with **more** examples than the cap, changing `--seed` selects a
-different subset (a label at or below the cap contributes all its examples regardless of
-seed, so seed-sensitivity must be asserted only on an over-cap label); a label with 3
-examples and `--examples-per-label 50` contributes exactly 3.
+identical example set, in both modes (assert on the examples embedded in the prompt sent to
+a fake classifier); for a label with **more** examples than the cap, changing `--seed`
+selects a different subset (a label at or below the cap contributes all its examples
+regardless of seed, so seed-sensitivity must be asserted only on an over-cap label); a
+label with 3 examples and `--examples-per-label 20` contributes exactly 3; under
+`--examples-per-label`, growing one label's pool leaves another label's sample unchanged;
+`--induction-examples 100` over 3 labels selects 34/33/33 summing to exactly 100;
+`--induction-examples 10` where one label has only 2 usable rows still selects 10 in total,
+that label contributing exactly 2; `--induction-examples 2` over 3 labels, and
+`--examples-per-label` together with `--induction-examples`, each exit with an error naming
+the offending flags/counts and issue zero LLM calls.
 
 #### FR-2.2: Single induction call sees all labels together
-One LLM call receives the sampled examples for **every** label at once, grouped by label,
-and returns a description for each. Seeing the labels side by side is what lets the model
-write descriptions that discriminate between them rather than describing each in
-isolation.
+One LLM call receives the sampled examples for **every** label at once, grouped by label
+and presented in a stable numbered order, and returns one description per label in that
+same order (AR-2.1). Seeing the labels side by side is what lets the model write
+descriptions that discriminate between them rather than describing each in isolation.
 **Verify:** inducing over a 3-label train split issues exactly one `.classify()` call on
 the induction classifier, and the prompt sent contains examples grouped under all 3 label
-values.
+values in sorted order with their positions stated.
 
 #### FR-2.3: Example texts are truncated, and total prompt size is bounded up front
-Each example's text is truncated to `--max-example-chars` (default 1000) Unicode code
+Each example's text is truncated to `--max-example-chars` (default 500) Unicode code
 points before being placed in the prompt. The truncation marker (a fixed `…[truncated]`
 suffix) is appended **outside** the cap, so the cap applies to retained source text only.
 
-Per-example and per-label caps alone do not bound the prompt: the **number** of labels is
-unbounded, so `labels × examples_per_label × max_example_chars` can still exceed the
-model's context window, and FR-2.2 forbids chunking as a fallback. The runner therefore
-performs a **total-size preflight** — estimated characters across all labels' sampled,
-truncated examples against a configurable `--max-prompt-chars` budget — and fails with an
-actionable error naming the offending totals and the flags to lower, **before** the
-provider call. A context-window rejection mid-call would otherwise waste the call and
-surface as an opaque provider error.
-**Verify:** an example of 5000 characters appears in the induction prompt truncated to 1000
+Per-example caps alone do not bound the prompt under `--examples-per-label`: the **number**
+of labels is unbounded there, so `labels × examples_per_label × max_example_chars` can
+still exceed the model's context window, and FR-2.2 forbids chunking as a fallback. The
+runner therefore performs a **total-size preflight** — estimated characters across all
+labels' sampled, truncated examples against a configurable `--max-prompt-chars` budget
+(default 100000) — and fails with an actionable error naming the offending totals and the
+flags to lower, **before** the provider call. A context-window rejection mid-call would
+otherwise waste the call and surface as an opaque provider error.
+
+`--induction-examples` (FR-2.1) bounds the example count directly, so it makes the prompt
+size a function of `N × max_example_chars` alone rather than of the label count — the
+preflight is far less likely to fire in that mode. It remains a required backstop in both
+modes regardless, since `--examples-per-label` is still label-count-unbounded and even a
+fixed `N` can exceed the budget at a large `--max-example-chars`.
+**Verify:** an example of 5000 characters appears in the induction prompt truncated to 500
 characters plus the marker; a 400-label train split at default caps exits with the
-preflight error naming `--examples-per-label`/`--max-example-chars`, and issues zero LLM
-calls.
+preflight error naming the sizing flag in effect and `--max-example-chars`, and issues zero
+LLM calls.
 
 #### FR-2.4: Induced output is a valid `categories.json` with exactly the dataset's labels
 Induction writes a `categories.json` conforming to the existing format
@@ -279,17 +329,26 @@ defined by `Category`/`Label` in `categories.py`), containing exactly **one** ca
 - `labels` — one entry per distinct label value in the train split. Each `value` is the
   label string **verbatim** from the dataset (FR-1.3); each `description` is induced.
 
-The written file is loaded back through `load_categories` and must validate. The returned
-label list is then reconciled **in code** against the expected label set: a missing or
-invented label fails induction with an error naming the discrepancy, rather than writing a
-`categories.json` whose labels can't be compared to the gold column. (This reconciliation
-must be a real set comparison over AR-2.1's `labels` list — Pydantic's default
-extra-field behavior ignores unknown keys, so a shape check alone would not detect an
-invented label.)
+The written file is loaded back through `load_categories` and must validate. Every `value`
+comes from the runner's **own** sorted label set, never from the model's response: the
+response carries descriptions only, mapped back onto labels **by position** (AR-2.1). A
+missing or invented label value is therefore structurally impossible, rather than a
+discrepancy to detect after the fact — there is no label-set reconciliation step, and no
+induction-specific retry layer for one (AR-2.3).
+
+The only residual failure mode is a wrong **number** of descriptions, and AR-2.1 closes
+that at the schema level: each description is its own required field, so a short response
+is rejected either by the provider's strict structured-output mode or — if that mode is
+unavailable and `Classifier` falls back to JSON-object mode — by Pydantic validation inside
+`Classifier.classify`, which retries it under the existing `--retries` budget. Either way
+induction receives exactly one description per label or raises.
 **Verify:** inducing over a train split with labels `{neg, pos}` writes a file that
 `load_categories` parses into one `Category` with exactly two `Label`s valued `neg` and
-`pos`; a fake induction response omitting `pos` exits with an error naming `pos`; a fake
-response adding an invented `neutral` exits with an error naming `neutral`.
+`pos`, carrying the response's 1st and 2nd descriptions in that order; the induction model
+built for that split has exactly the required fields
+`category_description`/`description_1`/`description_2` and rejects a response omitting
+`description_2`; no response a fake classifier can return causes a label value outside
+`{neg, pos}` to be written.
 
 #### FR-2.5: Induced label values must not collide with the reserved `none` sentinel
 If a dataset's distinct label values include `none`, or any value beginning with
@@ -329,25 +388,37 @@ zero LLM calls; a single-label train split induces successfully.
 
 ### Architectural Requirements
 
-#### AR-2.1: Induction schema builder in `schema.py`, with a fixed shape (not a field per label)
+#### AR-2.1: Induction schema builder in `schema.py` — one required description field per label position
 `schema.py` gains a builder returning the induction call's Pydantic output model, alongside
-the existing `build_classification_model`/`build_critic_model`/`build_reconciler_model`.
-Its shape is **fixed**, with the label descriptions carried as a list of objects:
+the existing `build_classification_model`/`build_critic_model`/`build_reconciler_model`. It
+takes the label count and returns a model whose fields are **positional**, carrying no
+label names at all:
 
 - `category_description: str` — what the category as a whole captures.
-- `labels: list[{label: str, description: str}]` — one entry per label.
+- `description_1 … description_N: str` — one **required** field per label, in FR-2.1's
+  sorted label order, where `N` is the number of distinct labels.
 
-It must **not** follow `build_classification_model`'s dynamic-field-per-key approach
-(`fields[cat.name] = ...` + `create_model(...)`). That works there because category names
-are author-chosen identifiers, but label values here are **dataset-chosen strings** that
-routinely contain spaces or punctuation (`"very negative"`, `"class 1"`, `"none-ish"`) and
-are therefore not valid Python/Pydantic field names. A field-per-label model would break or
-become unaddressable for exactly the datasets this feature targets.
+It is built with `create_model`, the same mechanism `build_classification_model` already
+uses. Field names are **positional indices, not label values**: label values are
+dataset-chosen strings that routinely contain spaces or punctuation (`"very negative"`,
+`"class 1"`, `"none-ish"`) and are therefore not valid Python/Pydantic field names, so a
+field-*per-label-value* model would break for exactly the datasets this feature targets.
+Indices are always valid identifiers, which is what makes the positional form possible
+where the label-named form is not.
 
-The list shape is also what makes FR-2.4's reconciliation possible: an invented label
-arrives as a list *entry* (comparable) rather than an extra object key (silently dropped by
-Pydantic's default extra-field behavior). Per INV-11, the schema enforces shape and
-cardinality only, never semantic label-set correctness.
+Arity is pinned by **required fields**, not by a length-bounded list. This is a verified
+constraint, not a preference: litellm serializes a Pydantic `response_format` with
+`"strict": true`, and strict structured output does not support `minItems`/`maxItems`, so a
+`list[...]` with `min_length == max_length == N` would be rejected by the provider — and
+`Classifier._attempt_completion`'s `except litellm.BadRequestError` would silently degrade
+**every** induction call to JSON-object mode. Required fields plus strict mode's
+`additionalProperties: false` express exactly-`N` in a form the strict path accepts.
+
+What this buys, and its limit: because the model never emits a label name, label identity
+cannot be lost or invented in transit (FR-2.4), and a short response is rejected at
+validation rather than discovered during reconciliation. Per INV-11 the schema still
+enforces shape and cardinality **only** — the descriptions' content is never validated, and
+a description that is confidently wrong about its label remains undetectable here.
 
 #### AR-2.2: Induction prompt — static system prompt, examples in the user message
 The induction system prompt lives in `resources/prompts/induction_prompt.txt` with its
@@ -361,6 +432,16 @@ system prompt once; `classifier.py:99-102` builds a fresh user message per call,
 `debate.py` assembles per-call untrusted content there). They are serialized in a
 delimited, structured form (e.g. JSON between fixed delimiters) rather than interpolated
 as loose prose.
+
+Because AR-2.1's response is positional, the payload must make each label's position
+**explicit**: labels are carried as an ordered sequence of entries that each state their
+own 1-based position alongside the label value and its examples — not as a JSON object
+keyed by label value, which would leave the positional contract resting on object-key
+ordering. The system prompt states the mapping rule directly (the description for the label
+at position `i` goes in `description_i`) and must be updated accordingly: the shipped
+`induction_prompt.txt` currently closes by asking for `a "labels" array with one entry per
+label, each entry containing that label's exact name`, which is exactly the label-name echo
+AR-2.1 removes.
 
 The prompt must instruct the model to treat **all** of that payload — example texts, label
 values, **and** the category name — as untrusted data to summarize, never as instructions
@@ -379,6 +460,19 @@ induction prompt (AR-2.2) and induction schema (AR-2.1) — reusing its existing
 output/JSON-fallback/bounded-retry logic unchanged, exactly as Spec 1's AR-2.3 does for
 the Critic and Reconciler. No new retry or LLM-call code is written. `--induction-model`
 selects its model, defaulting to `--model`.
+
+**`--induction-retries` is removed by this update.** It was shipped on 2026-09-14 as an
+interim response to a real production failure (a PubMed RCT run with 100 examples per label
+whose induction response repeatedly omitted one label), adding an
+`induce()`-level `max_reconciliation_retries` loop (default 3) that re-sent the identical
+prompt whenever the old label-set reconciliation failed. That loop was itself a violation of
+this AR's own "no new retry or LLM-call code" rule — a second, induction-specific retry
+layer sitting above `Classifier`'s. AR-2.1 removes the failure mode it existed for: label
+identity no longer round-trips through the response, and a wrong description count is
+rejected at validation and retried by `Classifier`'s existing `--retries` budget. Keeping
+both would leave two overlapping retry mechanisms where one suffices, so retry
+responsibility returns wholly to `Classifier`, and this AR's rule holds again without
+exception.
 
 ---
 
@@ -467,7 +561,8 @@ Two behaviors differ from `classify.py` and are deliberate:
   when it is not passed, no truncation happens and the entire test split is classified.
   It is named `--test-limit`, not `--limit`, to make explicit that it bounds only the
   test/classification split; it has no effect on the train split or induction sampling
-  (those are controlled independently by `--examples-per-label`/`--seed`), and the name
+  (those are controlled independently by `--examples-per-label`/`--induction-examples`/
+  `--seed`), and the name
   avoids collision with `classify.py`'s own unrelated `--limit` flag on a different entry
   point.
 **Verify:** `run --critics --sampling-runs 3 --consensus-threshold 2` produces a classified
@@ -514,8 +609,9 @@ call pass; LLM calls with fake `Classifier`-shaped objects exposing
 including the error and edge cases (FR-1.2's id validation and missing split, FR-1.3's
 untyped-integer/float labels and the local `001` case, FR-1.5's missing extra, FR-1.6's
 five split cases, FR-1.7's dropped rows and count-once rule, FR-1.8's two withheld forms
-and unseen labels, FR-2.1's over-cap seed sensitivity, FR-2.3's preflight, FR-2.4's
-missing/invented label, FR-2.5's sentinel including a supplied file, FR-2.6's induction
+and unseen labels, FR-2.1's over-cap seed sensitivity plus both sizing modes' quota,
+exclusivity and budget-floor rules, FR-2.3's preflight, FR-2.4's positional label mapping
+and required-field arity, FR-2.5's sentinel including a supplied file, FR-2.6's induction
 failure, FR-2.7's degenerate splits, FR-3.2's multi-category rejection, FR-3.4's overwrite
 preservation, FR-3.5's plain-mode closed vocabulary and `--test-limit` truncation, FR-3.6's
 three collision cases, FR-3.8's partial-failure status).
@@ -586,9 +682,12 @@ for the setup `cli.py` performs today, applying the same rules:
 - Numeric validation, extending `cli.py`'s existing rules (`sampling_runs >= 1`,
   `1 <= consensus_threshold <= sampling_runs`, finite non-negative `sampling_temperature`,
   `max_retries >= 1`) with this spec's: `--examples-per-label >= 1`,
+  `--induction-examples >= 1` and mutually exclusive with `--examples-per-label` (FR-2.1),
   `--max-example-chars >= 1`, `--max-prompt-chars >= 1`, `--seed` a non-negative integer,
   `--test-limit >= 0`. All validation runs **before** any directory write, Hub load, or LLM
-  call.
+  call. FR-2.1's `--induction-examples >= n_labels` rule is the one exception to that
+  ordering: it depends on the loaded label set, so it runs as soon as the labels are known
+  and still before any LLM call.
 
 ---
 
@@ -610,12 +709,12 @@ for the setup `cli.py` performs today, applying the same rules:
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | Integer version of this record's shape, so later readers can migrate |
+| `schema_version` | Integer version of this record's shape, so later readers can migrate. Bumped to **4** by FR-2.1's sampling redesign: `induction_examples` is new, `examples_per_label` becomes nullable (null whenever the total-budget mode ran), and `induction_retries` — recorded only by the interim flag AR-2.3 removes — disappears. That is a real change to the persisted shape, not an additive one |
 | `status` | `completed` \| `completed_with_failures` \| `failed` (FR-3.4, FR-3.8) |
 | `subcommand` | `induce` \| `classify` \| `run` |
 | `dataset` | Either `{source: "local", train_file, test_file}` or `{source: "hf", id, config, revision_requested, revision_resolved, train_split, test_split}` |
 | `text_column`, `label_column`, `category_name` | Column/category selection |
-| `seed`, `examples_per_label`, `max_example_chars`, `max_prompt_chars` | Induction sampling/bounding parameters (FR-2.1, FR-2.3) |
+| `seed`, `examples_per_label`, `induction_examples`, `max_example_chars`, `max_prompt_chars` | Induction sampling/bounding parameters (FR-2.1, FR-2.3). **When induction ran**, exactly one of `examples_per_label`/`induction_examples` is non-null, recording which sizing mode was used. For a `classify`-only run **both are null**, along with the other induction parameters — the whole induction flag group is absent from that subcommand, so there is no sizing mode to record |
 | `models` | `{model, induction_model, critic_model, reconciler_model}` as resolved (after defaulting to `--model`) |
 | `classifier_config` | `{critics, sampling_runs, sampling_temperature, consensus_threshold, allow_new_labels, retries, workers, test_limit}` |
 | `prompt_inputs` | `{system_prompt, task_description, extra_prompt}` — the paths given, or null |
@@ -761,9 +860,10 @@ tokens, or the `api_base` value (see Constraints).
   follows the plain-string prompt-builder shape and the system-prompt/user-message split
   Spec 1 established; AR-3.1 calls `classify_csv` unmodified while AR-3.4 states explicitly
   what `classify_csv` does *not* provide (the correction that exposed FR-3.5's plain-mode
-  contradiction); AR-2.1 sits alongside the three existing schema builders but deliberately
-  departs from `build_classification_model`'s dynamic-field approach for verified reasons;
-  FR-3.6 reuses `debate.AUDIT_COLUMN_SUFFIXES`.
+  contradiction); AR-2.1 sits alongside the three existing schema builders and now uses
+  `build_classification_model`'s own `create_model` mechanism, differing only in that its
+  dynamic field names are positional indices rather than caller-chosen names (dataset label
+  values aren't valid identifiers); FR-3.6 reuses `debate.AUDIT_COLUMN_SUFFIXES`.
 - [x] **Dependencies** — one new dependency (`datasets>=4`), justified by the
   user-requested HF support, scoped to an optional `[hf]` extra with lazy import (FR-1.5).
   Every API referenced (`load_dataset` with `name=`, `get_dataset_split_names` with
@@ -795,20 +895,30 @@ tokens, or the `api_base` value (see Constraints).
   retry (`classifier.py:120,129`) and AR-2.3 keeps it unmodified. CSV formula-injection
   exposure is restated as inherited, with the deferral reason given in Out of Scope.
 - [x] **Performance impact** — induction is one bounded LLM call whose prompt is capped on
-  all three axes (FR-2.1 count, FR-2.3 per-example chars **and** a total-size preflight);
+  all three axes (FR-2.1 count, FR-2.3 per-example chars **and** a total-size preflight),
+  and FR-2.1's `--induction-examples` mode tightens the first axis from
+  `labels × examples_per_label` to a flat `N` independent of the label count;
   classification cost is `classify_csv`'s existing profile with Spec 1's `--critics`
   multiplier and the `workers × sampling_runs` instantaneous-concurrency figure stated in
   Constraints, and `--test-limit` exposed for canary runs; AR-1.3's column projection before
   `to_pandas()` cuts the Arrow→pandas→CSV→pandas amplification. Whole-split materialization
   remains bounded by the no-streaming line in Out of Scope rather than by a mechanism, and
   a global concurrency cap is explicitly deferred there.
-- [x] **Rollout & migration** — purely additive: new entry point, new modules, new optional
-  extra; `classify.py`/`cli.py`/`pipeline.py` behavior is untouched (AR-3.1, AR-3.2), so no
-  existing invocation or output changes and there is nothing to migrate. The one behavioral
-  difference is the experiment runner's own plain-mode closed vocabulary (FR-3.5), scoped to
-  the new entry point and documented in Constraints/`--help`/README. Run directories are
-  always fresh and `--overwrite` touches only known artifact names (FR-3.4), so no prior
-  run or unrelated file is at risk.
+- [x] **Rollout & migration** — the original feature was purely additive: new entry point,
+  new modules, new optional extra; `classify.py`/`cli.py`/`pipeline.py` behavior untouched
+  (AR-3.1, AR-3.2), nothing to migrate. The one behavioral difference is the experiment
+  runner's own plain-mode closed vocabulary (FR-3.5), scoped to the new entry point and
+  documented in Constraints/`--help`/README. Run directories are always fresh and
+  `--overwrite` touches only known artifact names (FR-3.4), so no prior run or unrelated
+  file is at risk. The 2026-09-14 induction redesign is **not** purely additive and its
+  three breaking edges are each bounded: `--induction-retries` is removed (AR-2.3) — it
+  shipped the same day and was never released, so no documented invocation relies on it;
+  `run_config.json`'s shape changes, handled by the `schema_version` bump to 4 (Data
+  Requirements) rather than silently; and `induction_prompt.txt` plus the induction response
+  schema change, so `induction_prompt.txt` replay artifacts from earlier runs describe a
+  contract the current code no longer speaks. Previously written `categories.json` files are
+  unaffected — that format is unchanged (FR-2.4) — so existing `classify`/`run`
+  `--categories` invocations keep working.
 - [x] **Assumptions & risks** — Constraints states the assumptions (single label column,
   materializable datasets, gold labels never `none`, `none`-prediction comparability) and
   the inherited risks (Spec 1 cost multiplier, non-atomic CSV writes). Critique-surfaced
@@ -843,3 +953,84 @@ tokens, or the `api_base` value (see Constraints).
 questions.
 
 **Reorganized:** None.
+
+### Update: induction re-engineering — positional descriptions + total-budget sampling (2026-09-14, post-close)
+
+Prompted by a real production failure: `experiments/pubmed-rct` runs (5 labels, 100
+examples per label) repeatedly died with `induction response label set does not match the
+dataset's labels (missing: ['conclusions'], unexpected/invented: [])`. Diagnosis, verified
+against the code: the old AR-2.1 schema made the model **echo back label names** in an
+open-ended `labels` list with no arity bound, so a dropped label passed Pydantic and then
+hard-failed FR-2.4's post-hoc set comparison — even though the runner already knew the
+exact label set before the call and had put it in the prompt itself.
+
+**Applied:**
+- **AR-2.1 rewritten** — the induction model is now built with `create_model` as
+  `category_description` plus one **required** `description_1 … description_N` field per
+  label position, carrying no label names. Label identity never round-trips through the
+  response, so a missing or invented label became structurally impossible rather than
+  something to detect afterwards.
+- **FR-2.4 rewritten** — every `Label.value` now comes from the runner's own sorted label
+  set, with the response mapped on **by position**. The label-set reconciliation step, and
+  its Verify conditions (`a fake response omitting pos`, `a fake response adding an
+  invented neutral`), are gone: neither response is expressible under the new schema. They
+  were replaced with required-field-arity and positional-mapping conditions.
+- **FR-2.1 rewritten** — added `--induction-examples N` (total budget across all labels,
+  spread by largest-remainder so quotas sum to exactly `N`, with freed slots from
+  row-scarce labels re-divided among labels that still have spare rows), **mutually
+  exclusive** with `--examples-per-label`. Prompt volume is now boundable independently of
+  the label count. Also stated: the `--induction-examples >= n_labels` floor (a smaller
+  budget would give some label a zero quota and nothing to describe from, colliding with
+  FR-2.7), that `--examples-per-label`'s argparse default must become `None` so
+  "explicitly passed" is distinguishable from "left at default" (a default of `20` would
+  otherwise collide with every `--induction-examples` invocation — the same mechanic spec
+  4's AR-1.8 required of `--model`), and which reproducibility guarantee each mode keeps:
+  both are seed-deterministic, but only `--examples-per-label` keeps cross-label
+  independence, which `--induction-examples` gives up by construction since quotas depend
+  on other labels' row counts.
+- **AR-2.2 extended** — the user-message payload must carry labels as an ordered sequence
+  whose entries state their own 1-based position, not a JSON object keyed by label value,
+  so the positional contract doesn't rest on object-key ordering; and
+  `induction_prompt.txt` must be updated, since its shipped text still closes by asking for
+  `each entry containing that label's exact name`.
+- **AR-2.3** — documented `--induction-retries` as shipped behavior (added earlier the same
+  day as an interim fix: an `induce()`-level `max_reconciliation_retries` loop, default 3,
+  re-sending the identical prompt on a reconciliation mismatch; validated `>= 1`, recorded
+  in `run_config.json`, 5 tests), then **removed** it. It was itself a violation of
+  AR-2.3's own "no new retry or LLM-call code is written" rule, and AR-2.1 eliminates the
+  failure mode it existed for; keeping it would leave two overlapping retry layers where
+  `Classifier`'s `--retries` now suffices.
+- **`schema_version` bumped to 4** — `induction_examples` is new, `examples_per_label`
+  becomes nullable, and `induction_retries` disappears. Recorded as a real persisted-shape
+  change in Data Requirements, and the Rollout checklist item no longer claims this spec is
+  "purely additive" — its three breaking edges are enumerated and bounded there instead.
+
+**Rejected:**
+- **Bounding the description list with `min_length == max_length == N`** (the mechanism
+  originally proposed for Change A). Verified against the installed stack rather than
+  assumed: `litellm.utils.type_to_response_format_param` serializes a Pydantic
+  `response_format` with `"strict": true`, and strict structured output does not support
+  `minItems`/`maxItems` — the provider would reject the schema and
+  `Classifier._attempt_completion`'s `except litellm.BadRequestError` would silently
+  degrade **every** induction call to JSON-object mode, wasting a round-trip and losing
+  strict-mode guarantees permanently. Required fields express exactly-`N` in a form the
+  strict path accepts, which is why AR-2.1 uses them.
+- **Splitting FR-2.1 into separate per-label and total-budget requirements.** The two are
+  mutually exclusive answers to one question (how many examples each label contributes), so
+  one requirement is the "one truth per requirement" reading; splitting would also have
+  renumbered FR-2.2–FR-2.7 and orphaned the FR-2.2 cross-reference inside FR-2.3, for no
+  gain in testability.
+
+**Also corrected (spec/code drift found while verifying the above, unrelated to the
+redesign):**
+- FR-2.1 claimed `--examples-per-label` defaults to **50**; the implemented default is
+  **20**. Fixed, including the Verify clause that used `--examples-per-label 50`.
+- FR-2.3 claimed `--max-example-chars` defaults to **1000**; the implemented default is
+  **500**. Fixed, including the Verify clause's truncation figure. (This second drift was
+  not in the update request — found by checking every stated default against
+  `build_parser`.)
+- FR-2.3 never stated `--max-prompt-chars`'s default; it is **100000**. Added.
+
+**Reorganized:** None — every change landed in the requirement that already owned the
+behavior (FR-2.1 sampling, FR-2.4 output/reconciliation, AR-2.1 schema, AR-2.2 prompt,
+AR-2.3 retry policy). No FR/AR was added, removed, or renumbered.

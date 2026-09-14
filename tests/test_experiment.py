@@ -329,15 +329,22 @@ def test_project_and_filter_label_only_dropped_for_train_role():
 
 
 class FakeInductionClassifier:
-    def __init__(self, response=None, error=None):
+    def __init__(self, response=None, error=None, responses=None):
+        # ``responses`` (a list) is consumed one per call, in order -- for
+        # testing induce()'s reconciliation-mismatch retry, where successive
+        # calls need to return different label sets. ``response`` (singular)
+        # keeps returning the same value every call, for everything else.
         self.response = response
         self.error = error
+        self.responses = responses
         self.calls = []
 
     def classify(self, text):
         self.calls.append(text)
         if self.error is not None:
             raise self.error
+        if self.responses is not None:
+            return self.responses[len(self.calls) - 1]
         return self.response
 
 
@@ -441,6 +448,69 @@ def test_induce_rejects_missing_or_invented_labels():
             df, "text", "label", "cat", classifier,
             seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
         )
+
+
+def test_induce_retries_reconciliation_mismatch_then_succeeds():
+    # First two calls omit "neg" (a plausible one-off LLM slip); the third
+    # returns the complete label set -- induce() must retry and succeed
+    # rather than raising on the first mismatch.
+    df = _train_df([("a", "pos"), ("b", "neg")])
+    classifier = FakeInductionClassifier(
+        responses=[
+            _induction_response(["pos"]),
+            _induction_response(["pos"]),
+            _induction_response(["pos", "neg"]),
+        ]
+    )
+    outcome = induce(
+        df, "text", "label", "cat", classifier,
+        seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
+        max_reconciliation_retries=3,
+    )
+    assert len(classifier.calls) == 3
+    assert {lbl.value for lbl in outcome.category.labels} == {"pos", "neg"}
+    # Every retry re-sends the identical prompt -- only the mismatch itself
+    # is retried, not the sampling/prompt-building step.
+    assert classifier.calls[0] == classifier.calls[1] == classifier.calls[2]
+
+
+def test_induce_exhausts_reconciliation_retries_then_raises():
+    df = _train_df([("a", "pos"), ("b", "neg")])
+    classifier = FakeInductionClassifier(response=_induction_response(["pos"]))
+    with pytest.raises(ValueError, match="missing"):
+        induce(
+            df, "text", "label", "cat", classifier,
+            seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
+            max_reconciliation_retries=3,
+        )
+    assert len(classifier.calls) == 3  # exhausted every attempt, not just one
+
+
+def test_induce_reconciliation_retries_must_be_at_least_one():
+    df = _train_df([("a", "pos"), ("b", "neg")])
+    classifier = FakeInductionClassifier(response=_induction_response(["pos", "neg"]))
+    with pytest.raises(ValueError, match="max_reconciliation_retries"):
+        induce(
+            df, "text", "label", "cat", classifier,
+            seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
+            max_reconciliation_retries=0,
+        )
+    assert classifier.calls == []  # rejected before any call, like the other pre-call checks
+
+
+def test_induce_reconciliation_retry_does_not_mask_a_call_failure():
+    # A genuine classifier-call failure (not a reconciliation mismatch) must
+    # still propagate immediately as RuntimeError, not get treated as a
+    # retryable mismatch.
+    df = _train_df([("a", "pos"), ("b", "neg")])
+    classifier = FakeInductionClassifier(error=RuntimeError("boom"))
+    with pytest.raises(RuntimeError, match="induction call failed"):
+        induce(
+            df, "text", "label", "cat", classifier,
+            seed=0, examples_per_label=5, max_example_chars=100, max_prompt_chars=100_000,
+            max_reconciliation_retries=3,
+        )
+    assert len(classifier.calls) == 1  # not retried at this level
 
 
 def test_induce_rejects_duplicate_label():
