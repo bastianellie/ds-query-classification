@@ -53,6 +53,15 @@ automatically suppresses the default cap), use `INDUCTION_EXAMPLES`, e.g.
 running it — no provider call, no `datasets` package required — to check
 which sizing mode would actually be sent.
 
+Batch multiple queries into one classification call with `BATCH` (`dynamic`
+or a positive integer, e.g. `BATCH=8`), requiring `CRITICS=0` first — `--batch`
+and `--critics` are mutually exclusive, and this script refuses to silently
+drop `--critics` when `BATCH` is set. A batched run's results are not
+directly comparable to an unbatched one (see `experiment.py run --help`'s
+`--batch` documentation for the full flag surface, including
+`--batch-max-size`/`--batch-max-input-tokens`/`--batch-max-output-tokens`),
+e.g. `CRITICS=0 BATCH=dynamic experiments/pubmed-rct/run_experiment.sh`.
+
 ## Output
 
 Each run writes a fresh, timestamped directory under `runs/`

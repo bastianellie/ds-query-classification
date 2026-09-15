@@ -132,6 +132,63 @@ workspace/model-specific value that can't apply to several distinct models) —
 replicating a single model via `--n-classifiers` is unaffected; it works
 normally with Cerebus direct mode or with direct providers.
 
+### Batched classification: multiple queries per call
+
+`--batch` places several queries into one classification call instead of one
+per call, cutting LLM call volume roughly by the batch size — useful for
+large inputs where per-row latency/cost dominates. Mutually exclusive with
+`--critics` and with a resolved multi-classifier configuration (`--models`
+with 2+ values, or `--n-classifiers > 1`).
+
+Two sizing modes:
+
+```bash
+# dynamic: sizes every batch from the model's resolved (or overridden) input
+# token budget, re-measuring the actual rendered payload each time.
+python classify.py \
+  --input data/queries.csv \
+  --column text \
+  --output output/queries_classified.csv \
+  --categories resources/categories/example_support_tickets.json \
+  --batch dynamic
+
+# fixed: exactly N rows per call, trimmed down (never below 1) only for a
+# particular iteration whose rendered payload would otherwise exceed a
+# known budget.
+python classify.py \
+  --input data/queries.csv \
+  --column text \
+  --output output/queries_classified.csv \
+  --categories resources/categories/example_support_tickets.json \
+  --batch 8
+```
+
+`--batch-max-size` (default 50) is a hard cap on rows per batch regardless of
+token budget. `--batch-max-input-tokens`/`--batch-max-output-tokens` override
+the model's resolved input/output token budgets independently — each
+satisfies only its own side, and either can be set without the other.
+`--batch dynamic` requires a resolvable (or overridden) input budget; without
+one, the run fails before any LLM call with an actionable error naming the
+model id. An unresolvable output budget is never fatal — it just means no
+output-token cap is sent with batched calls, exactly like today's unbatched
+requests.
+
+A batch response failure is handled per-failure: a validation or truncation
+error isolates by splitting the batch in half and recursing (bisecting down
+to individual rows if needed); a rate limit or transient error retries the
+whole batch at its original size a bounded number of times; a credential or
+policy error fails every row in the batch immediately, without splitting or
+retrying.
+
+**Batched results are not directly comparable to an unbatched run** — a
+printed warning says so once per run. Placing multiple queries in one prompt
+means a row's own text, its position in the batch, and (after a `--restore`
+resume) the batch composition itself can all influence its neighbors'
+classifications, even though the prompt instructs the model to classify each
+query independently. `--workers` now counts concurrent in-flight *batches*,
+so peak token throughput scales with `--workers × batch size` — size
+`--workers` down accordingly for large batches.
+
 ### Reproducing the original decision-classification setup
 
 ```bash
@@ -170,6 +227,10 @@ python classify.py \
 | `--models` | 2+ model ids (duplicates allowed) for multi-classifier voting mode (see above); a single value is equivalent to `--model`. Mutually exclusive with `--critics` when given 2+ values. |
 | `--n-classifiers` | Number of classifier instances to construct (default: 1); replicates a single resolved model. No effect when `--models` has 2+ values. Mutually exclusive with `--critics` when > 1. |
 | `--cerebus` | Route every LLM call through the Cerebus/Portkey gateway instead of a direct provider (see below). |
+| `--batch` | Batch multiple queries into one call: `dynamic` (sized from the token budget) or a positive integer (fixed rows per call). Omit to classify one row per call, as today (see above). |
+| `--batch-max-size` | Hard cap on rows per batch regardless of token budget (default: 50). Requires `--batch`. |
+| `--batch-max-input-tokens` | Override the resolved input token budget used to size batches. Requires `--batch`. |
+| `--batch-max-output-tokens` | Override the resolved output token budget used as a runaway-response guard. Requires `--batch`. |
 
 ## Cerebus / Portkey gateway
 
@@ -238,7 +299,8 @@ python experiment.py run \
 Equivalent to `python -m query_classification.experiment ...`. All of
 `classify.py`'s classifier-configuration flags are available on
 `classify`/`run` (`--model`, `--critics`, `--models`, `--n-classifiers`,
-`--sampling-runs`, ...) — not `induce`, which has no classification role (only
+`--sampling-runs`, `--batch` and its `--batch-max-*` siblings, ...) — not
+`induce`, which has no classification role (only
 `--model` lives in the group shared with `induce`, for its induction-model
 fallback); `induce`/`run` additionally take `--seed`, `--examples-per-label`
 (default 20, per-label sampling cap), `--induction-examples` (a total example
@@ -331,6 +393,7 @@ src/query_classification/
   pipeline.py     # CSV batch loop (restore / limit / incremental save)
   debate.py       # --critics: sampling, consensus voting, Critic/Reconciler debate
   multi_model.py  # --models/--n-classifiers: N-classifier plurality-vote classification/audit trail
+  batching.py     # --batch: token-budget resolution, batch sizing, payload assembly, bisection
   cli.py          # argparse entry point (classify.py)
   dataset_io.py   # local/HF dataset loading, label normalization, row filtering
   induction.py    # category induction: sampling, one LLM call, reconciliation

@@ -37,6 +37,11 @@
 #   DRY_RUN=1 -- print the assembled experiment.py argv instead of running it
 #   (no provider call, no `datasets` package required); useful for checking
 #   which sizing mode would actually be sent.
+#   CRITICS (default 1/on) -- set CRITICS=0 to disable --critics/--critic-model/
+#   --reconciler-model (required before enabling BATCH, since --batch and
+#   --critics are mutually exclusive at the experiment.py level).
+#   BATCH (unset by default) -- 'dynamic' or a positive integer to enable
+#   --batch; requires CRITICS=0.
 
 set -euo pipefail
 
@@ -53,6 +58,8 @@ EXAMPLES_PER_LABEL="${EXAMPLES_PER_LABEL-20}"
 INDUCTION_EXAMPLES="${INDUCTION_EXAMPLES:-}"
 TEST_LIMIT="${TEST_LIMIT:-}"
 DRY_RUN="${DRY_RUN:-}"
+CRITICS="${CRITICS:-1}"
+BATCH="${BATCH:-}"
 
 cd "$REPO_ROOT"
 
@@ -69,6 +76,33 @@ echo "Run directory: $RUN_DIR"
 # /bin/bash is 3.2, which raises "unbound variable" under `set -u` when
 # expanding an *empty* array via "${ARR[@]}" (fixed upstream in bash 4.4,
 # but this repo can't assume a newer bash is installed/first-in-PATH).
+
+# --batch and --critics are mutually exclusive (experiment.py's FR-3.3) --
+# setting BATCH requires CRITICS=0 explicitly, rather than silently dropping
+# --critics: these scripts produce the accuracy numbers compared across
+# configurations, and silently switching the experimental condition would be
+# exactly the class of error the comparability caveat exists to prevent.
+if [ -n "$BATCH" ] && [ "$CRITICS" != "0" ]; then
+  echo "BATCH and CRITICS are mutually exclusive: set CRITICS=0 to enable BATCH." >&2
+  exit 1
+fi
+
+# A literal --critics passed through in "$@" would silently re-enable the
+# critics trio CRITICS=0 just disabled, the same passthrough-bypass risk
+# induction_examples_in_passthrough (below) guards against for
+# --induction-examples.
+critics_in_passthrough=0
+for arg in "$@"; do
+  if [ "$arg" = "--critics" ]; then
+    critics_in_passthrough=1
+    break
+  fi
+done
+if [ -n "$BATCH" ] && [ "$critics_in_passthrough" -eq 1 ]; then
+  echo "BATCH and --critics (passed through) are mutually exclusive." >&2
+  exit 1
+fi
+
 ARGS=(
   --hf-dataset armanc/pubmed-rct20k
   --text-column text
@@ -76,7 +110,11 @@ ARGS=(
   --category-name sentence_role
   --model @sciencedirect-global-openai/gpt-5.4-mini-2026-03-17
   --induction-model @sciencedirect-global-openai/gpt-5.4-mini-2026-03-17
-  --critics --critic-model @sciencedirect-global-openai/gpt-5.4-2026-03-05 --reconciler-model @sciencedirect-global-openai/gpt-5.4-2026-03-05
+)
+if [ "$CRITICS" != "0" ]; then
+  ARGS+=(--critics --critic-model "@sciencedirect-global-openai/gpt-5.4-2026-03-05" --reconciler-model "@sciencedirect-global-openai/gpt-5.4-2026-03-05")
+fi
+ARGS+=(
   --run-dir "$RUN_DIR"
   --seed "$SEED"
 )
@@ -100,6 +138,10 @@ fi
 
 if [ -n "$TEST_LIMIT" ]; then
   ARGS+=(--test-limit "$TEST_LIMIT")
+fi
+
+if [ -n "$BATCH" ]; then
+  ARGS+=(--batch "$BATCH")
 fi
 
 if [ -n "$DRY_RUN" ]; then
