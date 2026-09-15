@@ -776,3 +776,198 @@ def test_env_file_never_modified_by_aws_fallback_resolution(tmp_path, monkeypatc
     monkeypatch.delenv("CEREBUS_API_KEY", raising=False)
     classifier_module._resolve_cerebus_api_key()
     assert env_path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# spec 5 (batched classification), CLI-level: cli.py mirrors experiment.py's
+# --batch flag surface, validation, diagnostics, and factory construction.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def batch_classifier_inits(monkeypatch):
+    """Like `recorded_classifier_inits`, but the fake classify() handles the
+    batch model's result_1..result_n shape instead of a single-row shape."""
+    calls = []
+    original_init = Classifier.__init__
+
+    def _spy_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        calls.append(
+            {
+                "model_id": self.model_id,
+                "api_key": self.api_key,
+                "extra_headers": self.extra_headers,
+                "api_base": self.api_base,
+                "max_tokens": self.max_tokens,
+            }
+        )
+
+    def _fake_batch_classify(self, text):
+        fields = self.classification_model.model_fields.keys()
+        return {f: {"c": ["x"]} for f in fields}
+
+    monkeypatch.setattr(Classifier, "__init__", _spy_init)
+    monkeypatch.setattr(Classifier, "classify", _fake_batch_classify)
+    return calls
+
+
+def _write_cli_categories(path):
+    path.write_text(
+        '{"categories": [{"name": "c", "description": "d", '
+        '"labels": [{"value": "x", "description": "d"}]}]}'
+    )
+    return path
+
+
+def test_cli_batch_flags_present_on_parser():
+    from query_classification.cli import build_parser as build_cli_parser
+
+    parser = build_cli_parser()
+    ns = parser.parse_args(
+        ["--input", "in.csv", "--column", "text", "--batch", "8", "--batch-max-size", "20"]
+    )
+    assert ns.batch == "8"
+    assert ns.batch_max_size == 20
+
+
+def test_cli_batch_and_critics_rejected(tmp_path, monkeypatch, capsys):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--categories", str(cats_path), "--batch", "4", "--critics",
+    ]
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main()
+    assert exc_info.value.code == 1
+    assert "mutually exclusive" in capsys.readouterr().out.lower()
+
+
+def test_cli_batch_max_size_without_batch_rejected(tmp_path, capsys):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--categories", str(cats_path), "--batch-max-size", "10",
+    ]
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main()
+    assert exc_info.value.code == 1
+    assert "no effect without --batch" in capsys.readouterr().out
+
+
+def test_cli_batch_exceeding_max_size_rejected(tmp_path, capsys):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--categories", str(cats_path), "--batch", "100", "--batch-max-size", "50",
+    ]
+    with pytest.raises(SystemExit):
+        cli_main()
+    assert "exceeds" in capsys.readouterr().out
+
+
+def test_cli_batch_with_models_2plus_rejected(tmp_path, capsys):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--categories", str(cats_path), "--batch", "4", "--models", "a", "b",
+    ]
+    with pytest.raises(SystemExit):
+        cli_main()
+    assert "mutually exclusive" in capsys.readouterr().out.lower()
+
+
+def test_cli_batch_single_value_models_accepted(tmp_path, batch_classifier_inits):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\nworld\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--output", str(tmp_path / "out.csv"), "--categories", str(cats_path),
+        "--batch", "2", "--models", "gpt-4o-mini",
+    ]
+    cli_main()  # must not raise/exit
+
+
+def test_cli_batch_dynamic_unresolvable_input_is_fatal(tmp_path, capsys):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--categories", str(cats_path), "--model", "totally-made-up-model-xyz",
+        "--batch", "dynamic",
+    ]
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main()
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "Impossible to dynamically calculate number of queries" in out
+
+
+def test_cli_batch_caveat_printed_once(tmp_path, batch_classifier_inits, capsys):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\nworld\nfoo\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--output", str(tmp_path / "out.csv"), "--categories", str(cats_path),
+        "--batch", "2",
+    ]
+    cli_main()
+    out = capsys.readouterr().out
+    assert out.count("not directly comparable") == 1
+
+
+def test_cli_batch_classifier_carries_cerebus_gateway_headers_and_max_tokens(
+    tmp_path, monkeypatch, batch_classifier_inits
+):
+    from query_classification.cli import main as cli_main
+
+    _set_direct_mode_env(monkeypatch)
+    (tmp_path / "in.csv").write_text("text\nhello\nworld\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--output", str(tmp_path / "out.csv"), "--categories", str(cats_path),
+        "--cerebus", "--model", "gpt-4o-mini", "--batch", "2",
+    ]
+    cli_main()
+
+    assert len(batch_classifier_inits) == 1
+    call = batch_classifier_inits[0]
+    assert call["model_id"].startswith("openai/")
+    assert call["extra_headers"]
+    assert call["api_key"]
+    assert call["max_tokens"] == 16384  # gpt-4o-mini's real resolved output budget
