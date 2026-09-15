@@ -10,14 +10,20 @@ own primitives. Per INV-1, this module may import `categories.py`,
 from __future__ import annotations
 
 import json
+import logging
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import litellm
 from litellm.utils import type_to_response_format_param
 from pydantic import BaseModel
 
 from query_classification.categories import Category
+from query_classification.classifier import Classifier, classify_failure
+
+logger = logging.getLogger(__name__)
 
 # Duplicated deliberately from induction.py (`induction.py:31-32`) rather than
 # imported, since AR-1.1 forbids batching.py from importing induction.py. A
@@ -247,3 +253,169 @@ def plan_batch(
             was_trimmed = target < target_before_budget
 
     return BatchPlan(arity=target, was_trimmed=was_trimmed, oversized_row_index=oversized_row_index)
+
+
+class BatchStats:
+    """Thread-safe counters for FR-4.1's `run_config.json` `batch` block. Not
+    a module global -- scoped to a single run, constructed by the caller and
+    passed into `BatchRunner`."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._calls = 0
+        self._arities: list[int] = []
+        self._trims = 0
+        self._bisections = 0
+
+    def record_call(self, arity: int) -> None:
+        with self._lock:
+            self._calls += 1
+            self._arities.append(arity)
+
+    def record_trim(self) -> None:
+        with self._lock:
+            self._trims += 1
+
+    def record_bisection(self) -> None:
+        with self._lock:
+            self._bisections += 1
+
+    def snapshot(self) -> dict[str, int | float | None]:
+        """A freshly-built dict each call -- never a stored reference the
+        caller could mutate back into this object's own counters. Arity
+        fields are `None` (not `0`) until the first batched call is
+        recorded, matching FR-4.1's null-vs-zero rule."""
+        with self._lock:
+            arities = list(self._arities)
+            return {
+                "batched_calls": self._calls,
+                "min_arity": min(arities) if arities else None,
+                "mean_arity": (sum(arities) / len(arities)) if arities else None,
+                "max_arity": max(arities) if arities else None,
+                "trims": self._trims,
+                "bisections": self._bisections,
+            }
+
+
+class BatchRunner:
+    """Owns the arity-keyed classifier cache, batch formation (the sole
+    caller of `plan_batch`), and the batched call with bisection (FR-3.2)."""
+
+    def __init__(
+        self,
+        classifier_factory: Callable[[int], Classifier],
+        budgets: TokenBudgets,
+        stats: BatchStats,
+        max_size: int,
+        mode: str,
+        fixed_size: int | None,
+        system_prompt: str,
+        categories: list[Category],
+        batch_model_for: Callable[[int], type[BaseModel]],
+    ) -> None:
+        self._classifier_factory = classifier_factory
+        self.budgets = budgets
+        self.stats = stats
+        self.max_size = max_size
+        self.mode = mode
+        self.fixed_size = fixed_size
+        self.system_prompt = system_prompt
+        self.categories = categories
+        self.batch_model_for = batch_model_for
+        self._cache: dict[int, Classifier] = {}
+        self._cache_lock = threading.Lock()
+
+    def _get_classifier(self, arity: int) -> Classifier:
+        # Lookup-and-construction under one lock, not a check-then-insert --
+        # a plain check-then-insert is a compound operation two threads can
+        # execute simultaneously, producing two models for the same arity.
+        with self._cache_lock:
+            classifier = self._cache.get(arity)
+            if classifier is None:
+                classifier = self._classifier_factory(arity)
+                self._cache[arity] = classifier
+            return classifier
+
+    def iter_batches(self, rows: list[tuple[int, str]]) -> Iterator[list[int]]:
+        """`rows` is `(original_dataframe_index, text)` pairs, in remaining
+        order -- carrying the true row identity through `--restore`/`limit`
+        filtering. Yields successive lists of the covered rows' original
+        DataFrame indices, never positions into `rows`, never row text."""
+        texts = [text for _, text in rows]
+        start = 0
+        total = len(texts)
+        while start < total:
+            plan = plan_batch(
+                texts,
+                start=start,
+                mode=self.mode,
+                fixed_size=self.fixed_size,
+                max_size=self.max_size,
+                budgets=self.budgets,
+                system_prompt=self.system_prompt,
+                categories=self.categories,
+                batch_model_for=self.batch_model_for,
+            )
+            if plan.was_trimmed:
+                self.stats.record_trim()
+            if plan.oversized_row_index is not None:
+                original_index = rows[start + plan.oversized_row_index][0]
+                logger.warning(
+                    "Row %s alone exceeds the configured token budget; sending it as a "
+                    "batch of one.",
+                    original_index,
+                )
+            batch_indices = [rows[start + i][0] for i in range(plan.arity)]
+            yield batch_indices
+            start += plan.arity
+
+    def _attempt(self, classifier: Classifier, payload: str, arity: int) -> dict[str, Any]:
+        self.stats.record_call(arity)
+        return classifier.classify(payload)
+
+    @staticmethod
+    def _unpack(raw: dict[str, Any], arity: int) -> list[dict[str, Any]]:
+        return [raw[f"result_{i}"] for i in range(1, arity + 1)]
+
+    def run(self, texts: list[str]) -> list[dict[str, Any] | Exception]:
+        """Classify one batch, applying FR-3.2's bisection policy on
+        failure. `classify_failure` -- spec 6's, not re-derived here --
+        supplies both axes; the branch is exhaustive by construction over
+        the two booleans, so there is no "unrecognized" case to default."""
+        arity = len(texts)
+        classifier = self._get_classifier(arity)
+        payload = _render_payload(texts)
+
+        exc: Exception | None = None
+        try:
+            raw = self._attempt(classifier, payload, arity)
+        except Exception as e:  # noqa: BLE001 -- classified immediately below via
+            # classify_failure (spec 6); every branch either re-raises nothing
+            # (isolable split / retry / fail) so nothing is swallowed silently.
+            exc = e
+        else:
+            return self._unpack(raw, arity)
+
+        kind = classify_failure(exc)
+
+        if kind.isolable:
+            self.stats.record_bisection()
+            if arity == 1:
+                return [exc]
+            mid = (arity + 1) // 2  # first half takes the extra row when odd
+            return self.run(texts[:mid]) + self.run(texts[mid:])
+
+        if kind.retryable:
+            delay = classifier.retry_delay
+            for _ in range(2):  # at most 2 further attempts, beyond Classifier.classify's own
+                time.sleep(delay)
+                try:
+                    raw = self._attempt(classifier, payload, arity)
+                except Exception as e:  # noqa: BLE001 -- same classify_failure contract as above
+                    exc = e
+                    delay *= 2
+                    continue
+                return self._unpack(raw, arity)
+            return [exc] * arity
+
+        return [exc] * arity
