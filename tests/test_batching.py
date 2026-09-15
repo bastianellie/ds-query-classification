@@ -780,3 +780,205 @@ def test_iter_batches_named_index_warning_uses_original_index_when_oversized(cap
         batches = list(runner.iter_batches(rows))
     assert batches == [[107], [108]]
     assert "107" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# FR-3.1 / FR-3.3 / FR-3.4: pipeline.classify_csv with a BatchRunner
+# ---------------------------------------------------------------------------
+
+import pandas as pd  # noqa: E402
+
+from query_classification.pipeline import classify_csv  # noqa: E402
+
+
+def _valid_fake_completion(**kwargs):
+    user_content = kwargs["messages"][-1]["content"]
+    arity = user_content.count('"position"')
+    content = _valid_batch_content(arity)
+
+    class _Msg:
+        pass
+
+    class _Choice:
+        pass
+
+    class _Resp:
+        pass
+
+    msg = _Msg()
+    msg.content = content
+    choice = _Choice()
+    choice.message = msg
+    choice.finish_reason = "stop"
+    resp = _Resp()
+    resp.choices = [choice]
+    return resp
+
+
+def _make_batch_runner(monkeypatch, mode="fixed", fixed_size=5, max_size=50, fake_completion=None):
+    import litellm
+
+    monkeypatch.setattr(litellm, "completion", fake_completion or _valid_fake_completion)
+    cat = _category()
+    row_model = build_classification_model([cat])
+
+    def batch_model_for(n):
+        return build_batch_model(row_model, n)
+
+    def classifier_factory(n):
+        return Classifier(
+            model_id="openai/gpt-4o-mini",
+            system_prompt="sp",
+            classification_model=batch_model_for(n),
+            max_retries=1,
+            retry_delay=0.001,
+        )
+
+    budgets = TokenBudgets(max_input=None, max_output=None, resolved_input_model=None, resolved_output_model=None)
+    stats = BatchStats()
+    runner = BatchRunner(
+        classifier_factory=classifier_factory,
+        budgets=budgets,
+        stats=stats,
+        max_size=max_size,
+        mode=mode,
+        fixed_size=fixed_size,
+        system_prompt="sp",
+        categories=[cat],
+        batch_model_for=batch_model_for,
+    )
+    return runner, stats, [cat]
+
+
+def test_classify_csv_batched_produces_expected_batch_count_and_preserves_order(monkeypatch, tmp_path):
+    runner, stats, categories = _make_batch_runner(monkeypatch, mode="fixed", fixed_size=5)
+    df = pd.DataFrame({"text": [f"query {i}" for i in range(20)]})
+    input_path = tmp_path / "in.csv"
+    df.to_csv(input_path, index=False)
+
+    output_path = classify_csv(
+        input_path, "text", None, categories,
+        output_path=tmp_path / "out.csv", workers=2, batch_runner=runner,
+    )
+    out = pd.read_csv(output_path)
+    assert len(out) == 20
+    assert list(out["text"]) == list(df["text"])  # input order preserved
+    assert out["c"].notna().all()
+    assert stats.snapshot()["batched_calls"] == 4  # 20 rows / 5 per batch
+
+
+def test_classify_csv_batched_flush_positions_match_unbatched_run(monkeypatch, tmp_path):
+    import litellm
+
+    def fake_single_row_completion(**kwargs):
+        class _Msg:
+            content = json.dumps({"c": ["x"]})
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "completion", fake_single_row_completion)
+    cat = _category()
+    row_model = build_classification_model([cat])
+    plain_classifier = Classifier(model_id="openai/gpt-4o-mini", system_prompt="sp", classification_model=row_model)
+
+    df = pd.DataFrame({"text": [f"query {i}" for i in range(200)]})
+    unbatched_input = tmp_path / "unbatched_in.csv"
+    df.to_csv(unbatched_input, index=False)
+
+    save_calls_unbatched = []
+    real_to_csv = pd.DataFrame.to_csv
+
+    def spy_to_csv_unbatched(self, *args, **kwargs):
+        save_calls_unbatched.append(self["c"].notna().sum())
+        return real_to_csv(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", spy_to_csv_unbatched)
+    classify_csv(unbatched_input, "text", plain_classifier, [cat], output_path=tmp_path / "unbatched_out.csv")
+    monkeypatch.undo()
+
+    runner, stats, categories = _make_batch_runner(monkeypatch, mode="fixed", fixed_size=7)
+    batched_input = tmp_path / "batched_in.csv"
+    df.to_csv(batched_input, index=False)
+    save_calls_batched = []
+    monkeypatch.setattr(litellm, "completion", _valid_fake_completion)
+
+    def spy_to_csv_batched(self, *args, **kwargs):
+        save_calls_batched.append(self["c"].notna().sum())
+        return real_to_csv(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", spy_to_csv_batched)
+    classify_csv(batched_input, "text", None, categories, output_path=tmp_path / "batched_out.csv", batch_runner=runner)
+
+    assert len(save_calls_batched) == len(save_calls_unbatched)
+
+
+def test_classify_csv_batch_future_raising_leaves_accounting_consistent(monkeypatch, tmp_path):
+    def raising_completion(**kwargs):
+        raise RuntimeError("boom -- not a per-row failure, the batching layer itself blew up")
+
+    runner, stats, categories = _make_batch_runner(monkeypatch, mode="fixed", fixed_size=5, fake_completion=raising_completion)
+
+    df = pd.DataFrame({"text": [f"query {i}" for i in range(10)]})
+    input_path = tmp_path / "in.csv"
+    df.to_csv(input_path, index=False)
+    output_path = classify_csv(input_path, "text", None, categories, output_path=tmp_path / "out.csv", batch_runner=runner)
+    out = pd.read_csv(output_path)
+    assert len(out) == 10
+    assert out["c"].isna().all()  # every row failed, none classified
+
+
+def test_classify_csv_restore_classifies_only_remaining_rows(monkeypatch, tmp_path):
+    runner, stats, categories = _make_batch_runner(monkeypatch, mode="fixed", fixed_size=5)
+    df = pd.DataFrame({"text": [f"query {i}" for i in range(10)], "c": [None] * 10})
+    df.loc[:4, "c"] = "already-done"
+    input_path = tmp_path / "in.csv"
+    output_path = tmp_path / "out.csv"
+    df.to_csv(input_path, index=False)
+    df.to_csv(output_path, index=False)
+
+    classify_csv(input_path, "text", None, categories, output_path=output_path, restore=True, batch_runner=runner)
+    out = pd.read_csv(output_path)
+    assert list(out["c"][:5]) == ["already-done"] * 5
+    assert out["c"][5:].notna().all()
+    assert stats.snapshot()["batched_calls"] == 1  # exactly one batch of the 5 remaining rows
+
+
+def test_classify_csv_limit_with_fixed_size_10_produces_one_batch_of_3(monkeypatch, tmp_path):
+    runner, stats, categories = _make_batch_runner(monkeypatch, mode="fixed", fixed_size=10)
+    df = pd.DataFrame({"text": [f"query {i}" for i in range(20)]})
+    input_path = tmp_path / "in.csv"
+    df.to_csv(input_path, index=False)
+    classify_csv(input_path, "text", None, categories, output_path=tmp_path / "out.csv", limit=3, batch_runner=runner)
+    assert stats.snapshot()["batched_calls"] == 1
+    assert stats.snapshot()["max_arity"] == 3
+
+
+def test_classify_csv_batch_runner_with_critics_raises_value_error(monkeypatch, tmp_path):
+    runner, stats, categories = _make_batch_runner(monkeypatch)
+    df = pd.DataFrame({"text": ["a", "b"]})
+    input_path = tmp_path / "in.csv"
+    df.to_csv(input_path, index=False)
+    with pytest.raises(ValueError):
+        classify_csv(input_path, "text", None, categories, output_path=tmp_path / "out.csv", batch_runner=runner, critics=True)
+
+
+def test_classify_csv_batch_runner_with_models_raises_value_error(monkeypatch, tmp_path):
+    runner, stats, categories = _make_batch_runner(monkeypatch)
+    cat = categories[0]
+    row_model = build_classification_model([cat])
+    models = {
+        "m1": Classifier(model_id="openai/a", system_prompt="sp", classification_model=row_model),
+        "m2": Classifier(model_id="openai/b", system_prompt="sp", classification_model=row_model),
+    }
+    df = pd.DataFrame({"text": ["a", "b"]})
+    input_path = tmp_path / "in.csv"
+    df.to_csv(input_path, index=False)
+    with pytest.raises(ValueError):
+        classify_csv(input_path, "text", None, categories, output_path=tmp_path / "out.csv", batch_runner=runner, models=models)

@@ -15,6 +15,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from query_classification import debate, multi_model
+from query_classification.batching import BatchRunner
 from query_classification.categories import Category
 from query_classification.classifier import Classifier
 
@@ -42,6 +43,7 @@ def classify_csv(
     consensus_threshold: int = 4,
     allow_new_labels: bool = False,
     models: dict[str, Classifier] | None = None,
+    batch_runner: BatchRunner | None = None,
 ) -> Path:
     """Classify ``column`` of the input CSV and write the augmented CSV.
 
@@ -81,12 +83,19 @@ def classify_csv(
 
     have_classifier = classifier is not None
     have_models = models is not None
+    have_batch = batch_runner is not None
     if have_classifier and have_models:
         raise ValueError("classifier and models are mutually exclusive — provide exactly one")
-    if not have_classifier and not have_models:
+    if not have_classifier and not have_models and not have_batch:
         raise ValueError("exactly one of classifier or models must be provided")
+    if have_batch and (have_classifier or have_models):
+        raise ValueError("batch_runner is mutually exclusive with classifier and models")
     if critics and have_models:
         raise ValueError("critics and models are mutually exclusive")
+    if have_batch and critics:
+        raise ValueError("batch_runner and critics are mutually exclusive")
+    if have_batch and have_models:
+        raise ValueError("batch_runner and models are mutually exclusive")
     if have_models:
         if len(models) < 2:
             raise ValueError(f"models must have at least 2 entries, got {len(models)}")
@@ -220,6 +229,40 @@ def classify_csv(
     # mutation of `df` happens here on the main thread as futures complete, so
     # no locking is needed and output order stays tied to the row index.
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        if have_batch:
+            rows_with_index = [(idx, str(df.at[idx, column])) for idx in work_idx]
+            text_by_idx = dict(rows_with_index)
+            batches = list(batch_runner.iter_batches(rows_with_index))
+            future_to_batch_idx = {
+                executor.submit(batch_runner.run, [text_by_idx[i] for i in batch_idx]): batch_idx
+                for batch_idx in batches
+            }
+            for future in as_completed(future_to_batch_idx):
+                batch_idx = future_to_batch_idx[future]
+                try:
+                    outcomes = future.result()
+                except Exception as exc:  # noqa: BLE001 - the batching layer's own code
+                    # failed (not a per-row LLM failure -- BatchRunner.run already
+                    # converts those to per-row Exception objects and never raises
+                    # itself) -- convert to one failure per covered row so
+                    # classified + failed == completed == total still holds.
+                    outcomes = [exc] * len(batch_idx)
+                for idx, outcome in zip(batch_idx, outcomes):
+                    if isinstance(outcome, Exception):
+                        failed += 1
+                    else:
+                        for cat, val in outcome.items():
+                            df.at[idx, cat] = val
+                        classified += 1
+                    completed += 1
+                    progress.update(1)
+                    progress.set_postfix(ok=classified, failed=failed)
+                    if completed % save_every == 0:
+                        df.to_csv(output_path, index=False)
+            df.to_csv(output_path, index=False)
+            progress.close()
+            return output_path
+
         if critics:
             future_to_idx = {
                 executor.submit(
