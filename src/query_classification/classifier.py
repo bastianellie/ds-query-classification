@@ -267,14 +267,17 @@ class EmptyResponseError(Exception):
     hiccup takes, and repeating the identical request may well succeed."""
 
 
-_DROPPABLE_PARAMS: tuple[str, ...] = ("temperature",)
+_DROPPABLE_PARAMS: tuple[str, ...] = ("max_tokens", "temperature")
 """Parameters ``_attempt_completion`` drops, in this order, when a model
 raises ``litellm.UnsupportedParamsError`` for the structured-output request.
 Read by attribute lookup at call time (not bound as a default argument or
-copied at import), so a test can ``monkeypatch`` it. Its only entry today is
-``temperature`` -- the sole such parameter ``_completion_kwargs`` ever
-emits; a future parameter (e.g. an output-token cap) is added by appending
-to this tuple, not by adding another constructor flag."""
+copied at import), so a test can ``monkeypatch`` it. ``max_tokens`` goes
+first because it is only a guard -- proceeding without it reproduces
+today's unbatched behavior exactly -- whereas ``temperature`` is
+semantically meaningful and should survive if ``max_tokens`` alone was
+rejected. These are not the only parameters ``_completion_kwargs`` emits
+(``api_base``/``api_key``/``extra_headers`` are also conditional), just the
+only ones safe to drop and retry without changing the request's meaning."""
 
 
 def _classify_failure_verbose(exc: Exception) -> tuple[FailureKind, bool]:
@@ -436,6 +439,7 @@ class Classifier:
         temperature: float | None = None,
         api_key: str | None = None,
         extra_headers: dict[str, str] | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         if max_retries < 1:
             raise ValueError(f"max_retries must be >= 1, got {max_retries}")
@@ -455,6 +459,10 @@ class Classifier:
         # keeps relying on litellm's native credential handling.
         self.api_key = api_key
         self.extra_headers = extra_headers
+        # Unset by default: a generous output cap is a runaway guard batched calls
+        # set explicitly (spec 5, FR-2.5), never sized to squeeze a response, so no
+        # existing unbatched call site changes behavior by leaving it unset.
+        self.max_tokens = max_tokens
 
     def _completion_kwargs(self, messages: list[dict]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"model": self.model_id, "messages": messages}
@@ -470,6 +478,8 @@ class Classifier:
             kwargs["api_key"] = self.api_key
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
         return kwargs
 
     def _complete(self, messages: list[dict]) -> str:

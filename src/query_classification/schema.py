@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from pydantic import BaseModel, Field, create_model, model_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from query_classification.categories import Category
 
@@ -153,6 +153,34 @@ def build_induction_model(n_labels: int) -> type[BaseModel]:
         fields[f"description_{i}"] = (str, ...)
 
     return create_model("InductionResult", **fields)
+
+
+def build_batch_model(row_model: type[BaseModel], n: int) -> type[BaseModel]:
+    """Build a positional batch response schema for ``n`` rows.
+
+    One **required** field per position, ``result_1`` through ``result_n``,
+    each typed as a strict nested copy of ``row_model`` -- never a
+    length-bounded ``list`` field (see ``AR-2.1``: strict mode rejects
+    ``minItems``/``maxItems``). ``extra="forbid"`` is set on both the strict
+    nested copy and the outer model, so a short response is rejected by the
+    required fields, a long one by the outer model's strictness, and a bogus
+    field nested inside any ``result_i`` by the nested copy's own strictness.
+    ``row_model`` itself is left unmutated -- only ``build_classification_model``'s
+    own (non-strict) output is used for the unbatched path.
+    """
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+
+    strict_row_model = create_model(
+        f"{row_model.__name__}Strict",
+        __base__=row_model,
+        __config__=ConfigDict(extra="forbid"),
+    )
+
+    fields: dict[str, Any] = {
+        f"result_{i}": (strict_row_model, ...) for i in range(1, n + 1)
+    }
+    return create_model("BatchClassificationResult", __config__=ConfigDict(extra="forbid"), **fields)
 
 
 def schema_description(model: type[BaseModel]) -> str:
