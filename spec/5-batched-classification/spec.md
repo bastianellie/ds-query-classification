@@ -1,5 +1,9 @@
 # Spec 5: Batched Classification (`--batch`)
 
+> **Status: CLOSED** — Implemented and verified on 2026-09-15.
+> Implementation summary: `spec/5-batched-classification/implementation-summary.md`
+> Merged from worktree branch `spec/5-batched-classification` on 2026-09-15.
+
 ## Overview
 
 Today every row costs at least one LLM call: `pipeline.classify_csv` submits one
