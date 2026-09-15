@@ -326,13 +326,17 @@ class _FakeMessage:
 
 
 class _FakeChoice:
-    def __init__(self, content):
+    def __init__(self, content, finish_reason="stop"):
         self.message = _FakeMessage(content)
+        self.finish_reason = finish_reason
 
 
 class _FakeResponse:
-    def __init__(self, content):
-        self.choices = [_FakeChoice(content)]
+    def __init__(self, content, finish_reason="stop", choices=None):
+        if choices is not None:
+            self.choices = choices
+        else:
+            self.choices = [_FakeChoice(content, finish_reason=finish_reason)]
 
 
 def _valid_content():
@@ -365,20 +369,56 @@ def test_complete_drops_temperature_once_on_unsupported_params_error(monkeypatch
     assert "temperature" not in calls[1]
 
 
-def test_complete_reraises_unsupported_params_error_when_no_temperature_to_drop(monkeypatch):
-    """If the model rejects some OTHER param we don't control, there's nothing
-    to drop and retry — this must not loop or swallow the real error."""
+def test_complete_reaches_fallback_when_ladder_exhausted_and_fallback_succeeds(monkeypatch):
+    """If the model rejects some OTHER param we don't control (nothing left
+    to drop -- no temperature was even set), this may be a response_format
+    rejection rather than an unrelated-param rejection, so the JSON-mode
+    fallback is reached instead of raising immediately. Supersedes the old
+    test_complete_reraises_unsupported_params_error_when_no_temperature_to_drop,
+    whose premise ("there's nothing to drop and retry") stopped being the
+    whole story once ladder exhaustion started routing to a fallback attempt
+    (FR-2.3)."""
     import litellm
 
+    calls = []
+
     def fake_completion(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("response_format") == {"type": "json_object"}:
+            return _FakeResponse(_valid_content())
         raise litellm.UnsupportedParamsError(
             message="doesn't support tool_choice", model="", llm_provider="openai"
         )
 
     monkeypatch.setattr(litellm, "completion", fake_completion)
-    clf = _classifier()  # no temperature set at all
-    with pytest.raises(litellm.UnsupportedParamsError):
+    clf = _classifier()  # no temperature set at all -- the ladder has nothing to drop
+    content = clf._complete([{"role": "user", "content": "hi"}])
+    assert content == _valid_content()
+    assert len(calls) == 2  # structured-output attempt, then the JSON-mode fallback
+
+
+def test_complete_chains_fallback_failure_without_a_third_attempt(monkeypatch):
+    """When ladder exhaustion routes to the fallback and the fallback ALSO
+    fails, the failure surfaces (chained, per FR-2.2) without looping into a
+    third attempt -- preserving the "must not loop or swallow the real
+    error" guarantee the superseded test protected, now against the new
+    control flow."""
+    import litellm
+
+    calls = []
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        raise litellm.UnsupportedParamsError(
+            message="still unsupported", model="", llm_provider="openai"
+        )
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    clf = _classifier()
+    with pytest.raises(litellm.UnsupportedParamsError) as exc_info:
         clf._complete([{"role": "user", "content": "hi"}])
+    assert len(calls) == 2  # structured-output attempt, one fallback attempt, no third
+    assert exc_info.value.__cause__ is not None
 
 
 def test_complete_does_not_retry_temperature_drop_twice(monkeypatch):

@@ -10,10 +10,10 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 import litellm
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +225,199 @@ def cerebus_model_id(model_id: str) -> str:
     return model_id if model_id.startswith("openai/") else f"openai/{model_id}"
 
 
+class FailureKind(NamedTuple):
+    """Two independent axes describing what can be done about a classifier
+    failure.
+
+    ``retryable``: repeating the identical request may succeed.
+    ``isolable``: the request is answerable, but this attempt wasn't; a
+    caller that reshapes its input (e.g. sends less of it, or attributes the
+    failure to a subset of a batch) may succeed.
+
+    The two axes are independent -- a failure can be both, neither, or
+    exactly one. ``pydantic.ValidationError`` is deliberately both: LLM
+    output is stochastic, so an identical retry often succeeds, and a
+    persistent failure is still attributable to whatever input provoked it.
+    Collapsing this into a single three-way class would force a choice
+    between those two truths; keeping the axes independent doesn't.
+    """
+
+    retryable: bool
+    isolable: bool
+
+
+class TruncatedResponseError(Exception):
+    """The completion's ``finish_reason`` was ``"length"``: the model ran
+    out of its output allowance before finishing. Classified isolable, not
+    retryable -- an identical request under an identical cap will truncate
+    again."""
+
+
+class PolicyRefusalError(Exception):
+    """The completion's ``finish_reason`` was ``"content_filter"``: the
+    provider refused to answer. Classified neither retryable nor isolable --
+    the content itself was the problem, not the request's size or shape."""
+
+
+class EmptyResponseError(Exception):
+    """The completion returned no usable content: either no ``choices`` at
+    all, or a choice whose ``message.content`` is ``None`` and which wasn't
+    already explained by a ``finish_reason`` check. Classified retryable,
+    not isolable -- an empty completion is the shape a transient provider
+    hiccup takes, and repeating the identical request may well succeed."""
+
+
+_DROPPABLE_PARAMS: tuple[str, ...] = ("temperature",)
+"""Parameters ``_attempt_completion`` drops, in this order, when a model
+raises ``litellm.UnsupportedParamsError`` for the structured-output request.
+Read by attribute lookup at call time (not bound as a default argument or
+copied at import), so a test can ``monkeypatch`` it. Its only entry today is
+``temperature`` -- the sole such parameter ``_completion_kwargs`` ever
+emits; a future parameter (e.g. an output-token cap) is added by appending
+to this tuple, not by adding another constructor flag."""
+
+
+def _classify_failure_verbose(exc: Exception) -> tuple[FailureKind, bool]:
+    """Return ``(kind, matched)`` for ``exc``. ``matched`` is ``True`` when
+    ``exc`` hit one of the named entries below, ``False`` when it fell
+    through to the safe default. The public ``classify_failure`` discards
+    ``matched``; ``_log_classified_failure`` needs it, because a defaulted
+    ``FailureKind(False, False)`` must be distinguishable in logs from an
+    *explicitly* non-retryable, non-isolable type such as
+    ``BudgetExceededError`` -- both produce the same pair, but only one of
+    them means "this exception type was never seen before".
+
+    This is a flat, ordered chain -- never base-class grouping. Two
+    hierarchy facts, verified against the installed litellm, force this
+    shape: ``litellm.APIError`` has no subclasses and ``litellm.
+    APIStatusError`` doesn't exist, so there is no usable server/client base
+    class to catch against; and ``litellm.Timeout`` is *not* a subclass of
+    ``litellm.APIConnectionError`` (they are siblings under the openai SDK's
+    hierarchy, not litellm's own), so folding one into the other would
+    silently misclassify it. The five ``BadRequestError`` subclasses
+    (``ContextWindowExceededError``, ``ContentPolicyViolationError``,
+    ``LiteLLMUnknownProvider``, ``UnsupportedParamsError``,
+    ``ImageFetchError``) are placed before the plain-``BadRequestError``
+    entry for the same reason ``_attempt_completion``'s own
+    ``UnsupportedParamsError`` handling always has: a subclass carries a
+    different meaning than its base and must be caught first, or
+    ``isinstance`` against the base would swallow it.
+    """
+    retryable = FailureKind(True, False)
+    isolable_only = FailureKind(False, True)
+    fatal = FailureKind(False, False)
+    both = FailureKind(True, True)
+
+    # fmt: off
+    chain: list[tuple[type[Exception] | tuple[type[Exception], ...], FailureKind]] = [
+        ((litellm.RateLimitError, litellm.RouterRateLimitError,
+          litellm.RouterRateLimitErrorBasic), retryable),
+        ((litellm.InternalServerError, litellm.ServiceUnavailableError,
+          litellm.BadGatewayError), retryable),
+        (litellm.APIConnectionError, retryable),
+        (litellm.Timeout, retryable),
+        ((ValidationError, litellm.APIResponseValidationError,
+          litellm.JSONSchemaValidationError), both),
+        (litellm.ContextWindowExceededError, isolable_only),          # BadRequestError subclass
+        (TruncatedResponseError, isolable_only),
+        (litellm.ContentPolicyViolationError, fatal),                 # BadRequestError subclass
+        (PolicyRefusalError, fatal),
+        (litellm.LiteLLMUnknownProvider, fatal),                      # BadRequestError subclass
+        ((litellm.AuthenticationError, litellm.PermissionDeniedError,
+          litellm.NotFoundError), fatal),
+        (litellm.UnsupportedParamsError, fatal),                      # BadRequestError subclass
+        (litellm.ImageFetchError, fatal),                             # BadRequestError subclass
+        (litellm.BudgetExceededError, fatal),
+        (EmptyResponseError, retryable),
+        ((litellm.BadRequestError, litellm.InvalidRequestError,
+          litellm.UnprocessableEntityError), fatal),                  # BadRequestError itself
+        ((litellm.OpenAIError, litellm.BaseLLMException,
+          litellm.MockException), fatal),
+    ]
+    # fmt: on
+
+    for exc_types, kind in chain:
+        if isinstance(exc, exc_types):
+            return kind, True
+    return fatal, False
+
+
+def classify_failure(exc: Exception) -> FailureKind:
+    """Map ``exc`` to a ``FailureKind`` -- total over any exception. An
+    unrecognized type is treated as ``FailureKind(False, False)``, the safe
+    default: it neither retries nor invites a caller to reshape and resend.
+    """
+    return _classify_failure_verbose(exc)[0]
+
+
+def _log_classified_failure(
+    exc: Exception, kind: FailureKind, matched: bool, will_retry: bool
+) -> None:
+    """The sole logging call site for a classified failure in this module --
+    both ``_attempt_completion``'s fallback guard and ``classify``'s retry
+    loop route through here exactly once per failure (never both for the
+    same occurrence; see ``_attempt_completion``'s fallback guard, which
+    classifies but does not log). Logs only the exception's type name, both
+    axis values, whether the type matched a named rule or fell through to
+    the default, and whether the call will retry -- never the exception's
+    own message text, which could contain a response body, credential,
+    header, or endpoint value. This mirrors the existing sanitization
+    convention in ``debate.py``'s ``_sanitize_error`` and this module's own
+    ``_cerebus_key_help_message``, both of which log only
+    ``type(exc).__name__``.
+    """
+    logger.warning(
+        "%s classified retryable=%s isolable=%s (%s); %s",
+        type(exc).__name__,
+        kind.retryable,
+        kind.isolable,
+        "matched" if matched else "default branch",
+        "retrying" if will_retry else "giving up",
+    )
+
+
+def _extract_content(response: Any) -> str:
+    """Turn a successful ``litellm.completion()`` response into the ``str``
+    ``classify()`` expects, checking for an unusable response **in this
+    exact order** before falling through to a normal return. The ordering is
+    normative, not stylistic: the conditions overlap on real responses and
+    carry opposite classifications, so checking them in the wrong order
+    silently produces the wrong one.
+
+    1. Empty ``choices`` -- checked first only because every later check
+       indexes ``choices[0]``.
+    2. ``finish_reason == "length"`` -- raises ``TruncatedResponseError``.
+    3. ``finish_reason == "content_filter"`` -- raises ``PolicyRefusalError``.
+    4. ``message.content is None`` -- raises ``EmptyResponseError``.
+
+    Checks 2 and 3 must precede check 4: a reasoning model that spends its
+    entire output allowance on reasoning tokens returns
+    ``finish_reason="length"`` *with* ``content=None`` -- classifying that
+    as an empty response (retryable) would re-send an identical request
+    that will truncate again. A content-filtered response likewise often
+    carries no content; classifying that as retryable would re-send
+    policy-violating content on every retry attempt.
+
+    litellm's own ``map_finish_reason`` (verified against the installed
+    version) normalizes ``"guardrail_intervened"`` to ``"content_filter"``
+    before a response ever reaches here, and normalizes ``"eos"``,
+    ``"finish_reason_unspecified"``, ``"malformed_function_call"``, and any
+    value it doesn't recognize to ``"stop"`` -- so only ``"length"`` and
+    ``"content_filter"`` need an explicit check; nothing else can signal a
+    failure litellm doesn't already know about.
+    """
+    if not response.choices:
+        raise EmptyResponseError()
+    choice = response.choices[0]
+    if choice.finish_reason == "length":
+        raise TruncatedResponseError()
+    if choice.finish_reason == "content_filter":
+        raise PolicyRefusalError()
+    if choice.message.content is None:
+        raise EmptyResponseError()
+    return choice.message.content
+
+
 class Classifier:
     """Classify a single text against a dynamically-built schema.
 
@@ -281,45 +474,92 @@ class Classifier:
 
     def _complete(self, messages: list[dict]) -> str:
         kwargs = self._completion_kwargs(messages)
-        return self._attempt_completion(kwargs, allow_temperature_drop=True)
+        return self._attempt_completion(kwargs)
 
-    def _attempt_completion(
-        self, kwargs: dict[str, Any], *, allow_temperature_drop: bool
-    ) -> str:
+    def _attempt_completion(self, kwargs: dict[str, Any]) -> str:
         try:
             # Preferred: structured output with json_schema (not all models support this).
             response = litellm.completion(
                 response_format=self.classification_model, **kwargs
             )
-        except litellm.UnsupportedParamsError:
+        except litellm.UnsupportedParamsError as exc:
             # litellm.UnsupportedParamsError is a subclass of BadRequestError, so
             # this must be checked before that broader except below - otherwise
             # it would be misdiagnosed as "structured output unsupported" and
             # retried in json_object mode with the same (still-unsupported)
-            # temperature, failing again for the same reason instead of fixing it.
+            # parameter, failing again for the same reason instead of fixing it.
             # Some newer/reasoning models reject an explicit temperature outright
             # while reasoning is active - only their fixed default (usually 1) is
-            # accepted. Retry once with it dropped, rather than burning every
-            # outer retry attempt (classify()'s own loop) on a failure retrying
-            # alone can never fix. Only the --critics sampling role ever sets
-            # self.temperature, so this is a no-op for every other role.
-            if not allow_temperature_drop or "temperature" not in kwargs:
-                raise
-            return self._attempt_completion(
-                {k: v for k, v in kwargs.items() if k != "temperature"},
-                allow_temperature_drop=False,
-            )
-        except litellm.BadRequestError:
-            # Fallback: json_object mode - the system prompt describes the schema.
-            response = litellm.completion(
-                response_format={"type": "json_object"}, **kwargs
-            )
-        return response.choices[0].message.content
+            # accepted. Drop parameters from _DROPPABLE_PARAMS one at a time,
+            # rather than burning every outer retry attempt (classify()'s own
+            # loop) on a failure retrying alone can never fix. `kwargs` itself
+            # records what's already been dropped (a removed key is simply
+            # absent), so re-evaluating from the top of the ladder each time
+            # naturally skips already-dropped entries without needing separate
+            # bookkeeping.
+            for param in _DROPPABLE_PARAMS:
+                if param in kwargs:
+                    return self._attempt_completion(
+                        {k: v for k, v in kwargs.items() if k != param}
+                    )
+            # Ladder exhausted (or was never applicable to this model/role) --
+            # this may be a rejection of the response_format itself rather than
+            # a parameter we control, so fall through to the JSON-mode fallback
+            # using kwargs as they stand now (every droppable entry that was
+            # present has already been removed).
+            response = self._fallback_completion(kwargs, exc)
+        except (
+            litellm.ContextWindowExceededError,
+            litellm.ContentPolicyViolationError,
+            litellm.ImageFetchError,
+            litellm.LiteLLMUnknownProvider,
+        ):
+            # None of these four is about the response schema, so a schema
+            # fallback cannot help: an oversized request stays oversized, a
+            # policy-violating request stays violating, and the other two are
+            # provider/config problems a retried request wouldn't fix either.
+            # Must be listed before the plain BadRequestError catch below,
+            # since all four are BadRequestError subclasses (verified against
+            # the installed litellm) and would otherwise be swallowed by it.
+            raise
+        except litellm.BadRequestError as exc:
+            response = self._fallback_completion(kwargs, exc)
+        return _extract_content(response)
+
+    def _fallback_completion(
+        self, kwargs: dict[str, Any], first_attempt_exc: Exception
+    ) -> Any:
+        """The JSON-mode fallback: the system prompt already describes the
+        schema, so a model that rejected structured output (a plain
+        ``BadRequestError``) or that ran out of ``_DROPPABLE_PARAMS`` entries
+        to drop for an ``UnsupportedParamsError`` gets one more attempt here,
+        asking for plain JSON instead of a ``json_schema`` response format.
+
+        Guarded: any failure here is classified (never logged -- ``classify``'s
+        loop is this module's sole logging call site, see
+        ``_log_classified_failure``'s docstring) and re-raised as the
+        fallback's own exception, chained ``from`` the first attempt's
+        exception -- never the original object unchanged, and never a
+        wrapper. A caller needs the fallback's own type (e.g. spec 5's
+        batching layer catching ``ContextWindowExceededError`` by type), and
+        the first attempt's exception is preserved as ``__cause__`` so the
+        reason the fallback was entered at all stays diagnosable.
+        """
+        try:
+            return litellm.completion(response_format={"type": "json_object"}, **kwargs)
+        except Exception as fallback_exc:  # noqa: BLE001 - classified (not logged) and re-raised, chained, below
+            classify_failure(fallback_exc)
+            raise fallback_exc from first_attempt_exc
 
     def classify(self, text: str) -> dict[str, Any]:
         """Classify ``text``, returning a dict of {category: [labels]}.
 
-        Raises the last exception if all retry attempts fail.
+        Retries only failures ``classify_failure`` marks ``retryable`` (see
+        ``FailureKind``'s docstring) -- up to ``max_retries`` attempts, exactly
+        as before. A non-retryable failure raises immediately, on whichever
+        attempt it occurs, with no sleep and no further attempts: retrying a
+        credential error or a truncated response cannot succeed, so there is
+        nothing to wait for.
         """
         messages = [
             {"role": "system", "content": self.system_prompt},
@@ -332,24 +572,17 @@ class Classifier:
                 content = self._complete(messages)
                 result = self.classification_model.model_validate_json(content)
                 return result.model_dump(mode="json")
-            except Exception as e:  # noqa: BLE001 - retried and re-raised below
+            except Exception as e:  # noqa: BLE001 - classified below, then either retried or re-raised
                 last_exc = e
+                kind, matched = _classify_failure_verbose(e)
+                if not kind.retryable:
+                    _log_classified_failure(e, kind, matched, will_retry=False)
+                    raise
                 if attempt < self.max_retries:
-                    logger.warning(
-                        "Attempt %d/%d failed: %s. Retrying in %gs...",
-                        attempt,
-                        self.max_retries,
-                        e,
-                        self.retry_delay,
-                    )
+                    _log_classified_failure(e, kind, matched, will_retry=True)
                     time.sleep(self.retry_delay)
                 else:
-                    logger.warning(
-                        "Attempt %d/%d failed: %s. Giving up.",
-                        attempt,
-                        self.max_retries,
-                        e,
-                    )
+                    _log_classified_failure(e, kind, matched, will_retry=False)
 
         assert last_exc is not None
         raise last_exc
