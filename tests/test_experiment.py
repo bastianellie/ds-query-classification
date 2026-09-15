@@ -1443,7 +1443,7 @@ def test_models_end_to_end_run_config(tmp_path, fake_classify):
     )
     assert code in (0, None)
     config = json.loads((run_dir / "run_config.json").read_text())
-    assert config["schema_version"] == 4
+    assert config["schema_version"] == 5
     assert config["models"]["classification_models"] == ["a", "b"]
     assert config["models"]["model"] is None
     assert set(config["models"]["model_failure_counts"].keys()) == {"a", "b"}
@@ -1721,3 +1721,397 @@ def test_module_invocation_help():
     )
     assert result.returncode == 0
     assert "induce" in result.stdout and "classify" in result.stdout and "run" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# spec 5 (batched classification): --batch flag surface, resolution,
+# validation, provenance, and the comparability caveat.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_batch_classify(monkeypatch):
+    """Monkeypatch Classifier.classify for batch-shaped classification
+    models (result_1..result_n fields, each a per-category dict) -- distinct
+    from `fake_classify` above, which only handles single-row shapes."""
+    log = {"calls": 0}
+
+    def _classify(self, text):
+        log["calls"] += 1
+        fields = self.classification_model.model_fields.keys()
+        return {f: {"sentiment": ["positive"]} for f in fields}
+
+    monkeypatch.setattr(Classifier, "classify", _classify)
+    return log
+
+
+def test_batch_resolver_three_shapes():
+    from query_classification.experiment import _resolve_batch_sizing
+
+    ns = build_parser().parse_args(
+        ["classify", "--test-file", "e.csv", "--text-column", "text",
+         "--categories", "c.json", "--run-dir", "d", "--batch", "dynamic"]
+    )
+    assert _resolve_batch_sizing(ns) == ("dynamic", None)
+
+    ns = build_parser().parse_args(
+        ["classify", "--test-file", "e.csv", "--text-column", "text",
+         "--categories", "c.json", "--run-dir", "d", "--batch", "8"]
+    )
+    assert _resolve_batch_sizing(ns) == ("fixed", 8)
+
+    ns = build_parser().parse_args(
+        ["classify", "--test-file", "e.csv", "--text-column", "text",
+         "--categories", "c.json", "--run-dir", "d", "--batch", "1"]
+    )
+    assert _resolve_batch_sizing(ns) == ("fixed", 1)
+
+    ns = build_parser().parse_args(
+        ["classify", "--test-file", "e.csv", "--text-column", "text",
+         "--categories", "c.json", "--run-dir", "d"]
+    )
+    assert _resolve_batch_sizing(ns) == (None, None)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "auto", "3.5"])
+def test_batch_resolver_rejects_invalid_values(raw):
+    from query_classification.experiment import _resolve_batch_sizing
+
+    ns = build_parser().parse_args(
+        ["classify", "--test-file", "e.csv", "--text-column", "text",
+         "--categories", "c.json", "--run-dir", "d", "--batch", raw]
+    )
+    with pytest.raises(ValueError, match="--batch"):
+        _resolve_batch_sizing(ns)
+
+
+def test_batch_omitted_produces_one_call_per_row(tmp_path, fake_classify):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir)]
+    )
+    assert code in (0, None)
+    assert fake_classify["calls"] == 2  # one per row, unbatched
+
+
+def test_batch_dynamic_unresolvable_input_budget_is_fatal_with_zero_llm_calls(tmp_path, fake_classify):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--model", "totally-made-up-model-xyz", "--batch", "dynamic"]
+    )
+    assert code not in (0, None)
+    assert fake_classify["calls"] == 0
+    assert not (run_dir / "run_config.json").exists()  # fails during validation, before any run-dir work
+
+
+def test_batch_dynamic_unresolvable_input_budget_prints_verbatim_sentence(tmp_path, fake_classify, capsys):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--model", "totally-made-up-model-xyz", "--batch", "dynamic"]
+    )
+    out = capsys.readouterr().out
+    assert (
+        "Impossible to dynamically calculate number of queries: no max token "
+        "value known for totally-made-up-model-xyz. Please use `--batch INT` "
+        "to set a pre-definite numbers of queries."
+    ) in out
+
+
+def test_batch_dynamic_unresolvable_output_budget_warns_and_proceeds(tmp_path, fake_batch_classify, capsys):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--model", "totally-made-up-model-xyz", "--batch", "dynamic",
+         "--batch-max-input-tokens", "100000"]
+    )
+    assert code in (0, None)
+    out = capsys.readouterr().out
+    assert "no max output token value could be resolved" in out.lower()
+
+
+def test_batch_fixed_with_unknown_output_side_warns_and_enforces_input(tmp_path, fake_batch_classify, capsys):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--model", "totally-made-up-model-xyz", "--batch", "8",
+         "--batch-max-input-tokens", "100000"]
+    )
+    assert code in (0, None)
+    out = capsys.readouterr().out
+    assert "no max output token value could be resolved" in out.lower()
+
+
+def test_batch_max_input_tokens_override_sizes_batches(tmp_path, fake_batch_classify):
+    from query_classification.experiment import _resolve_batch_sizing
+
+    train = _write_csv(
+        tmp_path / "t.csv",
+        [(f"query {i}", "positive") for i in range(10)],
+        ["text", "label"],
+    )
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--model", "gpt-4o-mini", "--batch", "dynamic",
+         "--batch-max-input-tokens", "600", "--batch-max-output-tokens", "16384"]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["batch"]["max_input_tokens"] == 600
+    assert config["batch"]["resolved_input_model"] is None  # overridden, never walked
+
+
+@pytest.mark.parametrize(
+    "extra_flags",
+    [
+        ["--batch-max-size", "10"],
+        ["--batch-max-input-tokens", "1000"],
+        ["--batch-max-output-tokens", "1000"],
+    ],
+)
+def test_batch_sizing_flags_require_batch(tmp_path, extra_flags):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir)] + extra_flags
+    )
+    assert code not in (0, None)
+
+
+def test_batch_int_exceeding_max_size_rejected(tmp_path):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--batch", "100", "--batch-max-size", "50"]
+    )
+    assert code not in (0, None)
+
+
+def test_batch_with_critics_rejected(tmp_path):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--batch", "4", "--critics"]
+    )
+    assert code not in (0, None)
+
+
+def test_batch_with_resolved_multi_models_rejected(tmp_path):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--batch", "4", "--models", "a", "b"]
+    )
+    assert code not in (0, None)
+
+
+def test_batch_with_n_classifiers_rejected(tmp_path):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--batch", "4", "--n-classifiers", "3"]
+    )
+    assert code not in (0, None)
+
+
+def test_batch_with_single_value_models_is_accepted(tmp_path, fake_batch_classify):
+    """A single-value --models legally resolves to one classifier -- not a
+    multi-classifier configuration -- so it must NOT be rejected alongside
+    --batch."""
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--batch", "2", "--models", "gpt-4o-mini"]
+    )
+    assert code in (0, None)
+
+
+def test_batch_run_config_schema_version_5_and_null_when_no_batch(tmp_path, fake_classify):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir)]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["schema_version"] == 5
+    assert config["batch"]["mode"] is None
+    for field in ("fixed_size", "max_size", "max_input_tokens", "max_output_tokens",
+                  "batched_calls", "min_arity", "mean_arity", "max_arity", "trims", "bisections"):
+        assert config["batch"][field] is None
+
+
+def test_batch_run_config_records_call_count_and_arity_range(tmp_path, fake_batch_classify):
+    train = _write_csv(
+        tmp_path / "t.csv", [(f"q{i}", "positive") for i in range(9)], ["text", "label"]
+    )
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--batch", "4"]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["batch"]["mode"] == "fixed"
+    assert config["batch"]["fixed_size"] == 4
+    assert config["batch"]["batched_calls"] == 3  # 4 + 4 + 1
+    assert config["batch"]["min_arity"] == 1
+    assert config["batch"]["max_arity"] == 4
+
+
+def test_batch_classify_less_run_has_batch_null(tmp_path, fake_classify):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["induce", "--train-file", str(train), "--text-column", "text",
+         "--label-column", "label", "--category-name", "sentiment", "--run-dir", str(run_dir)]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["batch"] is None
+
+
+def test_batch_caveat_printed_exactly_once(tmp_path, fake_batch_classify, capsys):
+    train = _write_csv(
+        tmp_path / "t.csv", [(f"q{i}", "positive") for i in range(9)], ["text", "label"]
+    )
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir), "--batch", "4"]
+    )
+    out = capsys.readouterr().out
+    assert out.count("not directly comparable") == 1
+
+
+def test_batch_no_batch_run_prints_no_caveat(tmp_path, fake_classify, capsys):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir)]
+    )
+    out = capsys.readouterr().out
+    assert "not directly comparable" not in out
+
+
+def test_batch_prompt_contains_task_description_and_independence_instruction(tmp_path, fake_batch_classify):
+    from query_classification.experiment import _construct_classifiers
+
+    task_desc_path = tmp_path / "task.txt"
+    task_desc_path.write_text("Classify sentiment of product reviews.")
+    cats_path = _write_categories(tmp_path / "cats.json")
+    from query_classification.categories import load_categories
+
+    categories = load_categories(cats_path)
+    ns = build_parser().parse_args(
+        ["classify", "--test-file", "e.csv", "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(tmp_path / "d"),
+         "--batch", "4", "--task-description", str(task_desc_path)]
+    )
+    from query_classification.experiment import _validate_args
+
+    _validate_args(ns)
+    classifiers, _ = _construct_classifiers(ns, categories, will_induce=False, will_classify=True)
+    prompt = classifiers["batch_runner"].system_prompt
+    assert "Classify sentiment of product reviews." in prompt
+    assert "independently" in prompt
+    assert "result_1" in prompt
+    assert "positive" in prompt  # schema_description still enumerates label options
+
+
+def test_batch_test_limit_with_fixed_10_produces_one_batch_of_3(tmp_path, fake_batch_classify):
+    train = _write_csv(
+        tmp_path / "t.csv", [(f"q{i}", "positive") for i in range(20)], ["text", "label"]
+    )
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["run", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--batch", "10", "--test-limit", "3"]
+    )
+    assert code in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["batch"]["batched_calls"] == 1
+    assert config["batch"]["max_arity"] == 3
+
+
+def test_batch_failed_run_still_writes_batch_key_with_null_observed_fields(tmp_path, monkeypatch):
+    def _raising_classify(self, text):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(Classifier, "classify", _raising_classify)
+    # Force a mid-classification failure by making the batch runner's own
+    # code blow up (not a per-row failure) -- simplest reliable trigger is a
+    # completely broken model id that fails token-budget resolution AFTER
+    # validation already stored a resolved (fixed) mode -- instead, use a
+    # fixed-mode run with a real model id so validation passes, then let the
+    # classify phase raise via a monkeypatched BatchRunner.run.
+    import query_classification.experiment as experiment_module
+
+    def _raising_construct(*args, **kwargs):
+        raise RuntimeError("boom during classification construction")
+
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    real_construct = experiment_module._construct_classifiers
+
+    def _flaky_construct(args, categories, will_induce, will_classify, **kwargs):
+        if will_classify:
+            raise RuntimeError("boom during classification construction")
+        return real_construct(args, categories, will_induce, will_classify, **kwargs)
+
+    monkeypatch.setattr(experiment_module, "_construct_classifiers", _flaky_construct)
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir), "--batch", "4"]
+    )
+    assert code not in (0, None)
+    config = json.loads((run_dir / "run_config.json").read_text())
+    assert config["status"] == "failed"
+    assert config["batch"]["mode"] == "fixed"
+    assert config["batch"]["batched_calls"] is None
