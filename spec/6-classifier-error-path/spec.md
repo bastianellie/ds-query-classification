@@ -1,5 +1,9 @@
 # Spec 6: Classifier Error-Path Cleanup
 
+> **Status: CLOSED** — Implemented and verified on 2026-09-15.
+> Implementation summary: `spec/6-classifier-error-path/implementation-summary.md`
+> Merged from worktree branch `spec/6-classifier-error-path` on 2026-09-15.
+
 ## Overview
 
 `Classifier`'s ~40-line completion/retry chain (`classifier.py:282-355`) treats every failure
