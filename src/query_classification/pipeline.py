@@ -14,7 +14,7 @@ from typing import Any
 import pandas as pd
 from tqdm import tqdm
 
-from query_classification import debate, multi_model
+from query_classification import cost, debate, multi_model
 from query_classification.batching import BatchRunner
 from query_classification.categories import Category
 from query_classification.classifier import Classifier
@@ -24,6 +24,22 @@ def _audit_columns(category_name: str, audit_suffixes: tuple[str, ...]) -> set[s
     """The audit-trail columns a category generates under ``--critics``/
     ``--models`` (not including the category's own base column)."""
     return {f"{category_name}{suffix}" for suffix in audit_suffixes}
+
+
+def _classify_tracked(classifier: Classifier, text: str):
+    """Wraps ``classifier.classify(text)`` (unchanged arguments) in
+    ``track_usage()``, entirely on the worker thread (INV-6: only the
+    read-only call happens there). On success, returns ``(result, usage)``.
+    On failure, attaches the usage observed before the failure (which may be
+    ``None`` -- no billable attempt at all) to the exception as
+    ``_tracked_usage`` and re-raises, per FR-1.2's retain-on-failure design."""
+    with classifier.track_usage() as sink:
+        try:
+            result = classifier.classify(text)
+        except Exception as exc:
+            exc._tracked_usage = sink.usage
+            raise
+        return result, sink.usage
 
 
 def classify_csv(
@@ -44,6 +60,8 @@ def classify_csv(
     allow_new_labels: bool = False,
     models: dict[str, Classifier] | None = None,
     batch_runner: BatchRunner | None = None,
+    cost_collector: "cost.QueryCostCollector | None" = None,
+    cost_per_token: "cost.CostPerToken | None" = None,
 ) -> Path:
     """Classify ``column`` of the input CSV and write the augmented CSV.
 
@@ -220,6 +238,8 @@ def classify_csv(
         work_idx = work_idx[:limit]
 
     total = len(work_idx)
+    if cost_collector is not None:
+        cost_collector.set_rows_attempted(total)
     classified = 0
     failed = 0
     completed = 0
@@ -289,6 +309,11 @@ def classify_csv(
                 ): idx
                 for idx in work_idx
             }
+        elif cost_collector is not None:
+            future_to_idx = {
+                executor.submit(_classify_tracked, classifier, str(df.at[idx, column])): idx
+                for idx in work_idx
+            }
         else:
             future_to_idx = {
                 executor.submit(classifier.classify, str(df.at[idx, column])): idx
@@ -297,11 +322,19 @@ def classify_csv(
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
             try:
-                classification: dict[str, Any] = future.result()
+                result = future.result()
+                if cost_collector is not None and not critics and not have_models:
+                    classification, usage = result
+                else:
+                    classification = result
                 for cat, val in classification.items():
                     df.at[idx, cat] = val
                 classified += 1
-            except Exception:  # noqa: BLE001 - one bad row shouldn't abort the run.
+                if cost_collector is not None and not critics and not have_models:
+                    if usage is not None and cost_per_token is not None:
+                        row_cost = cost.compute_cost(*usage, cost_per_token)
+                        cost_collector.record(row_cost)
+            except Exception as e:  # noqa: BLE001 - one bad row shouldn't abort the run.
                 # Under --models, multi_model.run_multi_model never raises for
                 # ordinary model failures (even if every model failed), so this
                 # branch is reached only by a genuinely unexpected orchestration
@@ -309,6 +342,11 @@ def classify_csv(
                 # regardless of per-model outcomes. See {category}_model_errors/
                 # model_failure_counts for per-model health, not this counter.
                 failed += 1
+                if cost_collector is not None and not critics and not have_models:
+                    usage = getattr(e, "_tracked_usage", None)
+                    if usage is not None and cost_per_token is not None:
+                        row_cost = cost.compute_cost(*usage, cost_per_token)
+                        cost_collector.record(row_cost)
             completed += 1
             progress.update(1)
             progress.set_postfix(ok=classified, failed=failed)

@@ -6,6 +6,7 @@ via a fake ``boto3`` module injected into ``sys.modules``.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -971,3 +972,177 @@ def test_cli_batch_classifier_carries_cerebus_gateway_headers_and_max_tokens(
     assert call["extra_headers"]
     assert call["api_key"]
     assert call["max_tokens"] == 16384  # gpt-4o-mini's real resolved output budget
+
+
+# ---------------------------------------------------------------------------
+# Spec 7 (cost-and-timing-logging), CLI-level: cost_report.json sibling file
+# ---------------------------------------------------------------------------
+
+
+class _FakeUsageForCli:
+    def __init__(self, prompt_tokens, completion_tokens):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+def _cli_fake_completion_with_usage(prompt_tokens=10, completion_tokens=5):
+    def fake_completion(**kwargs):
+        model_cls = kwargs["response_format"]
+        fields = set(model_cls.model_fields.keys())
+        if fields and all(f.startswith("result_") for f in fields):
+            payload = {f: {"c": ["x"]} for f in fields}
+        else:
+            cat_name = next(iter(fields))
+            payload = {cat_name: ["x"]}
+
+        class _Msg:
+            content = json.dumps(payload)
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = _FakeUsageForCli(prompt_tokens, completion_tokens)
+
+        return _Resp()
+
+    return fake_completion
+
+
+@pytest.fixture
+def cli_fake_completion_with_usage(monkeypatch):
+    import litellm
+
+    # Importing litellm itself triggers a `load_dotenv()` that picks up this
+    # repo's real .env (DEFAULT_LLM_PROVIDER=cerebus) into the process
+    # environment before any test code runs -- neutralizing cli.py's own
+    # load_dotenv call isn't sufficient to undo that. Patching the resolver
+    # function itself keeps these tests offline and deterministic regardless
+    # of --cerebus / DEFAULT_LLM_PROVIDER, matching this file's own
+    # no-live-network-calls policy.
+    monkeypatch.setattr(classifier_module, "_resolve_cerebus_api_key", lambda: "test-key")
+    monkeypatch.setattr("query_classification.cli.load_dotenv", lambda *a, **k: None)
+    fn = _cli_fake_completion_with_usage()
+    monkeypatch.setattr(litellm, "completion", fn)
+    return fn
+
+
+def test_cli_produces_cost_report_json_sibling_to_output(tmp_path, cli_fake_completion_with_usage):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\nworld\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--output", str(tmp_path / "out.csv"), "--categories", str(cats_path),
+        "--model", "gpt-4o-mini",
+    ]
+    cli_main()
+    report_path = tmp_path / "out.cost_report.json"
+    assert report_path.exists()
+    report = json.loads(report_path.read_text())
+    assert report["schema_version"] == 1
+    assert report["induction_cost_usd"] is None
+    assert report["query_cost"]["count"] == 2
+    assert report["query_cost"]["estimated"] is False
+    assert report["total_cost_usd"] > 0
+    assert report["wall_clock_seconds"] > 0
+
+
+def test_cli_omitting_output_produces_sibling_to_input(tmp_path, cli_fake_completion_with_usage):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--categories", str(cats_path), "--model", "gpt-4o-mini",
+    ]
+    cli_main()
+    assert (tmp_path / "in.cost_report.json").exists()
+
+
+def test_cli_output_with_double_suffix_only_replaces_final_suffix(tmp_path, cli_fake_completion_with_usage):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--output", str(tmp_path / "out.csv.gz"), "--categories", str(cats_path),
+        "--model", "gpt-4o-mini",
+    ]
+    cli_main()
+    assert (tmp_path / "out.csv.cost_report.json").exists()
+    assert not (tmp_path / "out.cost_report.json").exists()
+
+
+def test_cli_failure_before_classify_csv_writes_no_cost_report(tmp_path, capsys):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--categories", str(tmp_path / "does_not_exist.json"),
+    ]
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main()
+    assert exc_info.value.code == 1
+    assert not (tmp_path / "in.cost_report.json").exists()
+    assert "Cost:" not in capsys.readouterr().out
+
+
+def test_cli_batch_report_estimated_flags(tmp_path, cli_fake_completion_with_usage):
+    from query_classification.cli import main as cli_main
+
+    (tmp_path / "in.csv").write_text(
+        "text\n" + "\n".join(f"q{i}" for i in range(9)) + "\n"
+    )
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--output", str(tmp_path / "out.csv"), "--categories", str(cats_path),
+        "--model", "gpt-4o-mini", "--batch", "4",
+    ]
+    cli_main()
+    report = json.loads((tmp_path / "out.cost_report.json").read_text())
+    assert report["batch_cost"]["estimated"] is False
+    assert report["batch_cost"]["count"] == 3
+    assert report["query_cost"]["estimated"] is True
+    assert report["query_cost"]["count"] == 9
+
+
+def test_cli_cerebus_resolved_pricing_reflects_gateway_routed_model_id(
+    tmp_path, monkeypatch, cli_fake_completion_with_usage
+):
+    from query_classification.cli import main as cli_main
+
+    _set_direct_mode_env(monkeypatch)
+    (tmp_path / "in.csv").write_text("text\nhello\n")
+    cats_path = _write_cli_categories(tmp_path / "cats.json")
+    import sys as _sys
+
+    _sys.argv = [
+        "classify.py", "--input", str(tmp_path / "in.csv"), "--column", "text",
+        "--output", str(tmp_path / "out.csv"), "--categories", str(cats_path),
+        "--cerebus", "--model", "gpt-4o-mini",
+    ]
+    cli_main()
+    report = json.loads((tmp_path / "out.cost_report.json").read_text())
+    # PricingCache's candidate walk handles the openai/ prefix cerebus_model_id
+    # adds (litellm's own table already resolves it directly), so pricing
+    # still resolves despite the gateway-routed model id.
+    assert report["pricing"]["resolved_input_model"] is not None
+    assert report["total_cost_usd"] > 0

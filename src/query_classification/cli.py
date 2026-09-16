@@ -13,6 +13,7 @@ from pathlib import Path
 import litellm
 from dotenv import load_dotenv
 
+from query_classification import cost
 from query_classification.batching import BatchRunner, BatchStats, resolve_token_budgets
 from query_classification.categories import load_categories
 from query_classification.classifier import (
@@ -374,6 +375,101 @@ def _build_classifier_dict(resolved_models: list[str], build_one) -> dict[str, C
     return result
 
 
+def _sum_poisoning(costs: list[float | None]) -> float | None:
+    """`None` if any entry is `None` (pricing unresolved for at least one
+    priced classifier), else the plain sum. An empty list sums to `0.0`."""
+    if any(c is None for c in costs):
+        return None
+    return sum(costs)
+
+
+def _assemble_cost_report(
+    classifier: Classifier | None,
+    critic_classifiers: dict[str, Classifier] | None,
+    reconciler_classifiers: dict[str, Classifier] | None,
+    models_classifiers: dict[str, Classifier] | None,
+    batch_runner: BatchRunner | None,
+    pricing_cache: cost.PricingCache,
+    query_cost_collector: cost.QueryCostCollector,
+    timer: cost.Timer,
+    batch_cost_per_token: cost.CostPerToken | None,
+    batch_model_id: str | None,
+) -> dict:
+    """Assembles spec 7's `cost_report.json` shape. Unlike `experiment.py`,
+    `cli.py` only ever calls this after `classify_csv` has already returned
+    successfully (FR-5.2) -- every classifier that would be used was already
+    constructed, so there is no partial-state/NameError risk here to guard
+    against. `induction_cost_usd` is always `null`: `cli.py` has no
+    induction concept."""
+    resolved_model_ids: set[str] = set()
+
+    def _price(clf: Classifier) -> float | None:
+        resolved_model_ids.add(clf.model_id)
+        cpt = pricing_cache.resolve(clf.model_id)
+        prompt_tokens, completion_tokens = clf.usage_totals()
+        return cost.compute_cost(prompt_tokens, completion_tokens, cpt)
+
+    classification_costs: list[float | None] = []
+    if classifier is not None:
+        classification_costs.append(_price(classifier))
+    for classifier_dict in (critic_classifiers, reconciler_classifiers, models_classifiers):
+        for clf in (classifier_dict or {}).values():
+            classification_costs.append(_price(clf))
+
+    have_batch = batch_runner is not None
+    if have_batch:
+        if batch_model_id is not None:
+            resolved_model_ids.add(batch_model_id)
+        prompt_tokens, completion_tokens = batch_runner.total_usage()
+        classification_costs.append(
+            cost.compute_cost(prompt_tokens, completion_tokens, batch_cost_per_token)
+            if batch_cost_per_token is not None
+            else None
+        )
+
+    classification_total = _sum_poisoning(classification_costs) if classification_costs else 0.0
+    total_cost_usd = classification_total
+
+    if have_batch:
+        batch_costs_pairs = batch_runner.stats.snapshot()["batch_costs"]
+        batch_cost = cost.stats_from_samples([c for _, c in batch_costs_pairs])
+        batch_cost["estimated"] = False
+        query_samples = cost.expand_batch_costs_to_query_samples(batch_costs_pairs)
+        query_cost = cost.stats_from_samples(query_samples)
+        query_cost["estimated"] = True
+    else:
+        batch_cost = None
+        if critic_classifiers is not None or models_classifiers is not None:
+            rows_attempted = query_cost_collector.rows_attempted() or 0
+            query_cost = cost.uniform_estimate(classification_total, rows_attempted)
+            query_cost["estimated"] = True
+        elif classifier is not None:
+            query_cost = cost.stats_from_samples(query_cost_collector.samples())
+            query_cost["estimated"] = False
+        else:
+            query_cost = {"mean_usd": None, "stddev_usd": None, "count": 0, "estimated": False}
+
+    if len(resolved_model_ids) == 1:
+        single_id = next(iter(resolved_model_ids))
+        cpt = pricing_cache.resolve(single_id)
+        pricing = {
+            "resolved_input_model": cpt.resolved_input_model,
+            "resolved_output_model": cpt.resolved_output_model,
+        }
+    else:
+        pricing = None
+
+    return {
+        "schema_version": 1,
+        "total_cost_usd": total_cost_usd,
+        "induction_cost_usd": None,
+        "query_cost": query_cost,
+        "batch_cost": batch_cost,
+        "pricing": pricing,
+        "wall_clock_seconds": timer.elapsed_seconds(),
+    }
+
+
 def main() -> None:
     load_dotenv(override=True)
     _quiet_logging()
@@ -465,6 +561,17 @@ def main() -> None:
                 )
 
         categories = load_categories(args.categories)
+        pricing_cache = cost.PricingCache()
+        timer = cost.Timer()
+        query_cost_collector = cost.QueryCostCollector()
+        single_model_cost_per_token = (
+            pricing_cache.resolve(resolved_models[0]) if len(resolved_models) == 1 else None
+        )
+        batch_cost_fn = (
+            (lambda p, c: cost.compute_cost(p, c, single_model_cost_per_token))
+            if single_model_cost_per_token is not None
+            else None
+        )
         # Under --critics or multi-classifier mode, the classifier's schema/
         # prompt must both be built with the same allow_new_labels value for the
         # constraint to actually apply (a schema-only or prompt-only fix is
@@ -560,6 +667,7 @@ def main() -> None:
                 system_prompt=batch_system_prompt,
                 categories=categories,
                 batch_model_for=batch_model_for,
+                cost_fn=batch_cost_fn,
             )
         elif len(resolved_models) > 1:
             # Multi-classifier mode is a --critics sibling: one Classifier per
@@ -647,7 +755,25 @@ def main() -> None:
             allow_new_labels=allow_new_labels,
             models=models_classifiers,
             batch_runner=batch_runner,
+            cost_collector=query_cost_collector,
+            cost_per_token=single_model_cost_per_token,
         )
+
+        cost_report = _assemble_cost_report(
+            classifier, critic_classifiers, reconciler_classifiers, models_classifiers,
+            batch_runner, pricing_cache, query_cost_collector, timer,
+            single_model_cost_per_token,
+            batch_model_id if batch_mode is not None else None,
+        )
+        csv_path = Path(args.output) if args.output else Path(args.input)
+        cost_report_path = csv_path.with_suffix(".cost_report.json")
+        cost.write_json_atomic(cost_report_path, cost_report)
+        cost_str = (
+            f"${cost_report['total_cost_usd']:.4f}"
+            if cost_report["total_cost_usd"] is not None
+            else "unknown"
+        )
+        print(f"Cost: {cost_str} | Time: {cost_report['wall_clock_seconds']:.1f}s")
     except (ValueError, FileNotFoundError, RuntimeError) as e:
         print(f"Error: {e}")
         sys.exit(1)

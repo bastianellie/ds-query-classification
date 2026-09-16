@@ -27,7 +27,6 @@ import os
 import platform
 import shutil
 import sys
-import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -36,7 +35,7 @@ import litellm
 import pandas as pd
 from dotenv import load_dotenv
 
-from query_classification import debate, multi_model
+from query_classification import cost, debate, multi_model
 from query_classification.batching import BatchRunner, BatchStats, resolve_token_budgets
 from query_classification.categories import Category, Label, load_categories
 from query_classification.classifier import (
@@ -80,6 +79,7 @@ _ARTIFACT_FILENAMES = (
     "test_classified.csv",
     "induction_prompt.txt",
     "sampled_examples.json",
+    "cost_report.json",
 )
 
 _RESERVED_SENTINEL_PREFIX = "none - "
@@ -794,6 +794,7 @@ def _construct_classifiers(
     will_classify: bool,
     gateway_kwargs: dict[str, Any] | None = None,
     n_labels: int | None = None,
+    cost_fn: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Construct every classifier role this invocation needs. Returns
     (classifiers, resolved_model_ids). ``gateway_kwargs`` should be resolved
@@ -914,6 +915,7 @@ def _construct_classifiers(
                     system_prompt=batch_system_prompt,
                     categories=categories,
                     batch_model_for=batch_model_for,
+                    cost_fn=cost_fn,
                 )
                 return classifiers, models
 
@@ -953,22 +955,110 @@ def _construct_classifiers(
     return classifiers, models
 
 
+def _sum_poisoning(costs: list[float | None]) -> float | None:
+    """`None` if any entry is `None` (pricing unresolved for at least one
+    priced classifier), else the plain sum. An empty list sums to `0.0`, not
+    `None` -- "nothing was constructed" is a known zero, not an unknown."""
+    if any(c is None for c in costs):
+        return None
+    return sum(costs)
+
+
+def _assemble_cost_report(
+    classifiers: dict[str, Any],
+    induction_classifier: Classifier | None,
+    pricing_cache: "cost.PricingCache",
+    query_cost_collector: "cost.QueryCostCollector",
+    timer: "cost.Timer",
+    batch_cost_per_token: "cost.CostPerToken | None",
+    batch_model_id: str | None,
+) -> dict[str, Any]:
+    """Assembles spec 7's `cost_report.json` shape from whatever classifier/
+    collector state exists at the time it's called -- from the success path
+    or the broad failure handler alike, so it must never raise on partial
+    state (every classifier instance it reads was already safely
+    initialized by the caller before the main try block began)."""
+    resolved_model_ids: set[str] = set()
+
+    def _price(clf: Classifier) -> float | None:
+        resolved_model_ids.add(clf.model_id)
+        cpt = pricing_cache.resolve(clf.model_id)
+        prompt_tokens, completion_tokens = clf.usage_totals()
+        return cost.compute_cost(prompt_tokens, completion_tokens, cpt)
+
+    effective_induction_classifier = induction_classifier or classifiers.get("induction")
+    induction_cost_usd = (
+        _price(effective_induction_classifier) if effective_induction_classifier is not None else 0.0
+    )
+
+    classification_costs: list[float | None] = []
+    if "classification" in classifiers:
+        classification_costs.append(_price(classifiers["classification"]))
+    for role in ("critics", "reconcilers", "multi_model"):
+        for clf in (classifiers.get(role) or {}).values():
+            classification_costs.append(_price(clf))
+
+    have_batch = "batch_runner" in classifiers
+    if have_batch:
+        if batch_model_id is not None:
+            resolved_model_ids.add(batch_model_id)
+        prompt_tokens, completion_tokens = classifiers["batch_runner"].total_usage()
+        classification_costs.append(
+            cost.compute_cost(prompt_tokens, completion_tokens, batch_cost_per_token)
+            if batch_cost_per_token is not None
+            else None
+        )
+
+    classification_total = _sum_poisoning(classification_costs) if classification_costs else 0.0
+    total_cost_usd = (
+        None
+        if induction_cost_usd is None or classification_total is None
+        else induction_cost_usd + classification_total
+    )
+
+    if have_batch:
+        batch_costs_pairs = classifiers["batch_stats"].snapshot()["batch_costs"]
+        batch_cost = cost.stats_from_samples([c for _, c in batch_costs_pairs])
+        batch_cost["estimated"] = False
+        query_samples = cost.expand_batch_costs_to_query_samples(batch_costs_pairs)
+        query_cost = cost.stats_from_samples(query_samples)
+        query_cost["estimated"] = True
+    else:
+        batch_cost = None
+        if "critics" in classifiers or "multi_model" in classifiers:
+            rows_attempted = query_cost_collector.rows_attempted() or 0
+            query_cost = cost.uniform_estimate(classification_total, rows_attempted)
+            query_cost["estimated"] = True
+        elif "classification" in classifiers:
+            query_cost = cost.stats_from_samples(query_cost_collector.samples())
+            query_cost["estimated"] = False
+        else:
+            query_cost = {"mean_usd": None, "stddev_usd": None, "count": 0, "estimated": False}
+
+    if len(resolved_model_ids) == 1:
+        single_id = next(iter(resolved_model_ids))
+        cpt = pricing_cache.resolve(single_id)
+        pricing = {
+            "resolved_input_model": cpt.resolved_input_model,
+            "resolved_output_model": cpt.resolved_output_model,
+        }
+    else:
+        pricing = None
+
+    return {
+        "schema_version": 1,
+        "total_cost_usd": total_cost_usd,
+        "induction_cost_usd": induction_cost_usd,
+        "query_cost": query_cost,
+        "batch_cost": batch_cost,
+        "pricing": pricing,
+        "wall_clock_seconds": timer.elapsed_seconds(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Run-directory helpers
 # ---------------------------------------------------------------------------
-
-
-def _write_json_atomic(path: Path, data: Any) -> None:
-    """Write JSON via a temp file + os.replace so an interruption never
-    leaves a malformed control file on disk."""
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with open(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        Path(tmp_name).replace(path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
 
 
 def _preflight_run_dir(run_dir: Path, overwrite: bool) -> None:
@@ -1110,6 +1200,17 @@ def main() -> None:
         sys.exit(1)
 
     stage = "starting"
+    # Initialized here, before any of the main try block's substantive work,
+    # so the report-assembly step below (and the broad failure handler) can
+    # never raise NameError/UnboundLocalError regardless of which phase a
+    # failure occurs in (spec 7).
+    pricing_cache = cost.PricingCache()
+    timer = cost.Timer()
+    induction_classifier: Classifier | None = None
+    classifiers: dict[str, Any] = {}
+    query_cost_collector = cost.QueryCostCollector()
+    single_model_cost_per_token: cost.CostPerToken | None = None
+    batch_model_id_for_report: str | None = None
     config: dict[str, Any] = {
         "schema_version": _SCHEMA_VERSION,
         "subcommand": args.subcommand,
@@ -1252,11 +1353,15 @@ def main() -> None:
                 max_example_chars=args.max_example_chars,
                 max_prompt_chars=args.max_prompt_chars,
             )
+            # Captured before the classification-phase _construct_classifiers
+            # call below reassigns `classifiers` -- otherwise this reference
+            # would be silently lost (spec 7, FR-3.4).
+            induction_classifier = classifiers["induction"]
             (run_dir / "train.csv").write_text(train_df.to_csv(index=False))
             (run_dir / "induction_prompt.txt").write_text(outcome.rendered_prompt)
-            _write_json_atomic(run_dir / "sampled_examples.json", outcome.sampled_examples)
+            cost.write_json_atomic(run_dir / "sampled_examples.json", outcome.sampled_examples)
             categories_path = run_dir / "categories.json"
-            _write_json_atomic(
+            cost.write_json_atomic(
                 categories_path,
                 {"categories": [outcome.category.model_dump(mode="json")]},
             )
@@ -1346,8 +1451,28 @@ def main() -> None:
             test_csv_path = run_dir / "test.csv"
             test_df.to_csv(test_csv_path, index=False)
 
+            # `--batch` requires exactly one resolved model per run (spec 5's
+            # own validation), so one PricingCache.resolve() suffices for
+            # every arity's cost_fn closure. The raw (pre-cerebus-prefix)
+            # model id resolves identically -- PricingCache's candidate walk
+            # already strips an `openai/` prefix.
+            single_model_cost_per_token = (
+                pricing_cache.resolve(args.resolved_classifier_models[0])
+                if len(args.resolved_classifier_models) == 1
+                else None
+            )
+            batch_mode_active, _ = getattr(args, "resolved_batch_sizing", (None, None))
+            if batch_mode_active is not None:
+                batch_model_id_for_report = args.resolved_classifier_models[0]
+            batch_cost_fn = (
+                (lambda p, c: cost.compute_cost(p, c, single_model_cost_per_token))
+                if single_model_cost_per_token is not None
+                else None
+            )
+
             classifiers, models = _construct_classifiers(
-                args, categories, will_induce=False, will_classify=True, gateway_kwargs=gateway_kwargs
+                args, categories, will_induce=False, will_classify=True,
+                gateway_kwargs=gateway_kwargs, cost_fn=batch_cost_fn,
             )
             if will_induce:
                 # The induction-only _construct_classifiers call above never
@@ -1391,6 +1516,8 @@ def main() -> None:
                 allow_new_labels=args.allow_new_labels,
                 models=classifiers.get("multi_model"),
                 batch_runner=batch_runner,
+                cost_collector=query_cost_collector,
+                cost_per_token=single_model_cost_per_token,
             )
 
             if batch_runner is not None:
@@ -1451,7 +1578,19 @@ def main() -> None:
         config["status"] = status
         stage = "finalizing"
         _log_phase("finalizing")
-        _write_json_atomic(run_dir / "run_config.json", config)
+        cost.write_json_atomic(run_dir / "run_config.json", config)
+
+        cost_report = _assemble_cost_report(
+            classifiers, induction_classifier, pricing_cache, query_cost_collector,
+            timer, single_model_cost_per_token, batch_model_id_for_report,
+        )
+        cost.write_json_atomic(run_dir / "cost_report.json", cost_report)
+        cost_str = (
+            f"${cost_report['total_cost_usd']:.4f}"
+            if cost_report["total_cost_usd"] is not None
+            else "unknown"
+        )
+        print(f"Cost: {cost_str} | Time: {cost_report['wall_clock_seconds']:.1f}s")
 
     except Exception as e:  # noqa: BLE001 - any phase failure must still produce an auditable run_config.json
         for key in (
@@ -1468,7 +1607,15 @@ def main() -> None:
         config["status"] = "failed"
         config["failure"] = f"{type(e).__name__}: failed during {stage}"
         try:
-            _write_json_atomic(run_dir / "run_config.json", config)
+            cost.write_json_atomic(run_dir / "run_config.json", config)
+        except OSError:
+            pass
+        try:
+            cost_report = _assemble_cost_report(
+                classifiers, induction_classifier, pricing_cache, query_cost_collector,
+                timer, single_model_cost_per_token, batch_model_id_for_report,
+            )
+            cost.write_json_atomic(run_dir / "cost_report.json", cost_report)
         except OSError:
             pass
         print(f"Error: {e}")

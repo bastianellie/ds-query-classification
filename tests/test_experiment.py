@@ -2115,3 +2115,215 @@ def test_batch_failed_run_still_writes_batch_key_with_null_observed_fields(tmp_p
     assert config["status"] == "failed"
     assert config["batch"]["mode"] == "fixed"
     assert config["batch"]["batched_calls"] is None
+
+
+# ---------------------------------------------------------------------------
+# Spec 7 / FR-3.3 / FR-3.4 / FR-4.1 / FR-5.1 / FR-5.3: cost_report.json
+# ---------------------------------------------------------------------------
+
+
+class _FakeUsageForExperiment:
+    def __init__(self, prompt_tokens, completion_tokens):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+def _fake_completion_with_usage(prompt_tokens=10, completion_tokens=5):
+    def fake_completion(**kwargs):
+        model_cls = kwargs["response_format"]
+        fields = set(model_cls.model_fields.keys())
+        if "category_description" in fields:
+            payload = {f: "d" for f in fields}
+        elif fields == {"challenges", "proposed_label", "argument"}:
+            payload = {"challenges": False, "proposed_label": None, "argument": "no challenge"}
+        elif fields == {"labels", "reasoning"}:
+            payload = {"labels": ["positive"], "reasoning": "r"}
+        elif fields and all(f.startswith("result_") for f in fields):
+            payload = {f: {"sentiment": ["positive"]} for f in fields}
+        else:
+            cat_name = next(iter(fields))
+            payload = {cat_name: ["positive"]}
+
+        class _Msg:
+            content = json.dumps(payload)
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = _FakeUsageForExperiment(prompt_tokens, completion_tokens)
+
+        return _Resp()
+
+    return fake_completion
+
+
+@pytest.fixture
+def fake_completion_with_usage(monkeypatch):
+    import litellm
+    import query_classification.classifier as classifier_module
+
+    # This repo's local .env sets DEFAULT_LLM_PROVIDER=cerebus, and main()
+    # re-loads it via load_dotenv(override=True) on every invocation, which
+    # would stomp a monkeypatched CEREBUS_API_KEY env var back to empty.
+    # Patching the resolver function itself keeps these tests offline and
+    # deterministic, matching this file's own no-live-network-calls policy.
+    monkeypatch.setattr(classifier_module, "_resolve_cerebus_api_key", lambda: "test-key")
+    fn = _fake_completion_with_usage()
+    monkeypatch.setattr(litellm, "completion", fn)
+    return fn
+
+
+def test_run_end_to_end_cost_report_nonzero_induction_distinct_from_classification(
+    tmp_path, fake_completion_with_usage
+):
+    train = _write_csv(
+        tmp_path / "train.csv",
+        [("great product", "positive"), ("bad product", "negative")] * 3,
+        ["text", "label"],
+    )
+    test = _write_csv(
+        tmp_path / "test.csv",
+        [("fantastic", "positive"), ("awful", "negative")],
+        ["text", "label"],
+    )
+    run_dir = tmp_path / "run1"
+    code = _run_main(
+        [
+            "run", "--train-file", str(train), "--test-file", str(test),
+            "--text-column", "text", "--label-column", "label",
+            "--category-name", "sentiment", "--run-dir", str(run_dir),
+            "--model", "gpt-4o-mini",
+        ]
+    )
+    assert code in (0, None)
+    assert (run_dir / "cost_report.json").exists()
+    report = json.loads((run_dir / "cost_report.json").read_text())
+    assert report["schema_version"] == 1
+    assert report["induction_cost_usd"] > 0
+    classification_cost = report["total_cost_usd"] - report["induction_cost_usd"]
+    assert classification_cost > 0
+    assert report["induction_cost_usd"] != classification_cost
+    assert report["query_cost"]["count"] == 2
+    assert report["query_cost"]["estimated"] is False
+    assert report["wall_clock_seconds"] > 0
+
+
+def test_induce_only_cost_report_query_cost_zero_batch_null(tmp_path, fake_completion_with_usage):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["induce", "--train-file", str(train), "--text-column", "text",
+         "--label-column", "label", "--category-name", "sentiment", "--run-dir", str(run_dir),
+         "--model", "gpt-4o-mini"]
+    )
+    assert code in (0, None)
+    report = json.loads((run_dir / "cost_report.json").read_text())
+    assert report["query_cost"]["count"] == 0
+    assert report["query_cost"]["mean_usd"] is None
+    assert report["query_cost"]["stddev_usd"] is None
+    assert report["batch_cost"] is None
+    assert report["induction_cost_usd"] > 0
+
+
+def test_batch_cost_report_estimated_flags(tmp_path, fake_completion_with_usage):
+    train = _write_csv(
+        tmp_path / "t.csv", [(f"q{i}", "positive") for i in range(9)], ["text", "label"]
+    )
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(train), "--text-column", "text",
+         "--categories", str(cats_path), "--run-dir", str(run_dir),
+         "--batch", "4", "--model", "gpt-4o-mini"]
+    )
+    assert code in (0, None)
+    report = json.loads((run_dir / "cost_report.json").read_text())
+    assert report["batch_cost"]["estimated"] is False
+    assert report["batch_cost"]["count"] == 3  # 4 + 4 + 1
+    assert report["query_cost"]["estimated"] is True
+    assert report["query_cost"]["count"] == 9
+
+
+def test_critics_cost_report_uniform_estimate(tmp_path, fake_completion_with_usage):
+    test = _write_csv(tmp_path / "test.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    cats_path = _write_categories(tmp_path / "cats.json")
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["classify", "--test-file", str(test), "--text-column", "text",
+         "--label-column", "label", "--categories", str(cats_path),
+         "--run-dir", str(run_dir), "--critics", "--model", "gpt-4o-mini"]
+    )
+    assert code in (0, None)
+    report = json.loads((run_dir / "cost_report.json").read_text())
+    assert report["query_cost"]["estimated"] is True
+    assert report["query_cost"]["stddev_usd"] == 0.0
+    assert report["query_cost"]["count"] == 2
+    classification_total = report["total_cost_usd"] - report["induction_cost_usd"]
+    assert report["query_cost"]["mean_usd"] == pytest.approx(classification_total / 2)
+
+
+def test_unresolvable_model_cost_report_monetary_fields_null(tmp_path, fake_completion_with_usage):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["induce", "--train-file", str(train), "--text-column", "text",
+         "--label-column", "label", "--category-name", "sentiment", "--run-dir", str(run_dir),
+         "--model", "totally-unresolvable-model-xyz"]
+    )
+    assert code in (0, None)
+    report = json.loads((run_dir / "cost_report.json").read_text())
+    assert report["induction_cost_usd"] is None
+    assert report["total_cost_usd"] is None
+    # A single model id was priced (just unresolvable), so `pricing` is
+    # still populated -- diagnostic, showing the attempt failed -- rather
+    # than null (null is reserved for the 2+-distinct-models case, spec
+    # deviation row 4).
+    assert report["pricing"] == {"resolved_input_model": None, "resolved_output_model": None}
+    assert report["wall_clock_seconds"] > 0
+    assert report["query_cost"]["count"] == 0
+
+
+def test_main_try_block_failure_still_writes_cost_report_with_wall_clock(tmp_path, fake_completion_with_usage):
+    (tmp_path / "test.csv").write_text("text,label\nhi,positive\n")
+    (tmp_path / "train.csv").write_text("wrongcol\nvalue\n")
+    run_dir = tmp_path / "r"
+    code = _run_main(
+        ["run", "--train-file", str(tmp_path / "train.csv"), "--test-file", str(tmp_path / "test.csv"),
+         "--text-column", "text", "--label-column", "label", "--category-name", "sentiment",
+         "--run-dir", str(run_dir)]
+    )
+    assert code == 1
+    report = json.loads((run_dir / "cost_report.json").read_text())
+    assert report["wall_clock_seconds"] > 0
+
+
+def test_early_validation_failure_writes_no_cost_report(tmp_path, monkeypatch):
+    import query_classification.classifier as classifier_module
+
+    monkeypatch.setattr(classifier_module, "_resolve_cerebus_api_key", lambda: "test-key")
+    run_dir = tmp_path / "r"
+    code = _run_main(
+        ["classify", "--test-file", str(tmp_path / "nonexistent.csv"), "--text-column", "text",
+         "--categories", str(tmp_path / "also_nonexistent.json"), "--run-dir", str(run_dir)]
+    )
+    assert code == 1
+    assert not (run_dir / "cost_report.json").exists()
+    assert not (run_dir / "run_config.json").exists()
+
+
+def test_stdout_prints_exactly_one_cost_time_line(tmp_path, fake_completion_with_usage, capsys):
+    train = _write_csv(tmp_path / "t.csv", [("a", "positive"), ("b", "negative")], ["text", "label"])
+    run_dir = tmp_path / "run"
+    code = _run_main(
+        ["induce", "--train-file", str(train), "--text-column", "text",
+         "--label-column", "label", "--category-name", "sentiment", "--run-dir", str(run_dir),
+         "--model", "gpt-4o-mini"]
+    )
+    assert code in (0, None)
+    out = capsys.readouterr().out
+    cost_lines = [line for line in out.splitlines() if line.startswith("Cost: ")]
+    assert len(cost_lines) == 1
+    assert "Time:" in cost_lines[0]

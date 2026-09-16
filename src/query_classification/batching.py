@@ -266,6 +266,7 @@ class BatchStats:
         self._arities: list[int] = []
         self._trims = 0
         self._bisections = 0
+        self._batch_costs: list[tuple[int, float | None]] = []
 
     def record_call(self, arity: int) -> None:
         with self._lock:
@@ -279,6 +280,13 @@ class BatchStats:
     def record_bisection(self) -> None:
         with self._lock:
             self._bisections += 1
+
+    def record_cost(self, arity: int, cost: float | None) -> None:
+        """The cost of one top-level formed batch's first attempt only --
+        never a retry-at-original-size or bisection call. See
+        `BatchRunner.run`'s own `_top_level` gating."""
+        with self._lock:
+            self._batch_costs.append((arity, cost))
 
     def snapshot(self) -> dict[str, int | float | None]:
         """A freshly-built dict each call -- never a stored reference the
@@ -294,6 +302,7 @@ class BatchStats:
                 "max_arity": max(arities) if arities else None,
                 "trims": self._trims,
                 "bisections": self._bisections,
+                "batch_costs": list(self._batch_costs),
             }
 
 
@@ -312,6 +321,7 @@ class BatchRunner:
         system_prompt: str,
         categories: list[Category],
         batch_model_for: Callable[[int], type[BaseModel]],
+        cost_fn: Callable[[int, int], float | None] | None = None,
     ) -> None:
         self._classifier_factory = classifier_factory
         self.budgets = budgets
@@ -322,8 +332,26 @@ class BatchRunner:
         self.system_prompt = system_prompt
         self.categories = categories
         self.batch_model_for = batch_model_for
+        # A plain callable, not a `cost.CostPerToken`/`cost.py` import -- keeps
+        # this module's import list exactly as it is today (`categories.py`/
+        # `classifier.py` only). The caller (experiment.py/cli.py, which does
+        # import cost.py) builds it as a closure over one resolved price.
+        self._cost_fn = cost_fn
         self._cache: dict[int, Classifier] = {}
         self._cache_lock = threading.Lock()
+
+    def total_usage(self) -> tuple[int, int]:
+        """Sum of `usage_totals()` across every classifier currently cached
+        by arity -- so callers never need to reach into `_cache` directly."""
+        with self._cache_lock:
+            classifiers = list(self._cache.values())
+        total_prompt = 0
+        total_completion = 0
+        for classifier in classifiers:
+            p, c = classifier.usage_totals()
+            total_prompt += p
+            total_completion += c
+        return (total_prompt, total_completion)
 
     def _get_classifier(self, arity: int) -> Classifier:
         # Lookup-and-construction under one lock, not a check-then-insert --
@@ -377,18 +405,35 @@ class BatchRunner:
     def _unpack(raw: dict[str, Any], arity: int) -> list[dict[str, Any]]:
         return [raw[f"result_{i}"] for i in range(1, arity + 1)]
 
-    def run(self, texts: list[str]) -> list[dict[str, Any] | Exception]:
+    def run(
+        self, texts: list[str], *, _top_level: bool = True
+    ) -> list[dict[str, Any] | Exception]:
         """Classify one batch, applying FR-3.2's bisection policy on
         failure. `classify_failure` -- spec 6's, not re-derived here --
         supplies both axes; the branch is exhaustive by construction over
-        the two booleans, so there is no "unrecognized" case to default."""
+        the two booleans, so there is no "unrecognized" case to default.
+
+        `_top_level` (keyword-only, default `True`) marks the very first,
+        outermost call for a formed batch -- the recursive bisection calls
+        below pass `_top_level=False`. Only a top-level call's first
+        `_attempt()` (before any retry-at-original-size or bisection) has its
+        cost recorded, via `self._cost_fn`, when one is configured."""
         arity = len(texts)
         classifier = self._get_classifier(arity)
         payload = _render_payload(texts)
+        record_cost = _top_level and self._cost_fn is not None
 
         exc: Exception | None = None
         try:
-            raw = self._attempt(classifier, payload, arity)
+            if record_cost:
+                with classifier.track_usage() as sink:
+                    try:
+                        raw = self._attempt(classifier, payload, arity)
+                    finally:
+                        cost = self._cost_fn(*sink.usage) if sink.usage is not None else None
+                        self.stats.record_cost(arity, cost)
+            else:
+                raw = self._attempt(classifier, payload, arity)
         except Exception as e:  # noqa: BLE001 -- classified immediately below via
             # classify_failure (spec 6); every branch either re-raises nothing
             # (isolable split / retry / fail) so nothing is swallowed silently.
@@ -403,7 +448,7 @@ class BatchRunner:
             if arity == 1:
                 return [exc]
             mid = (arity + 1) // 2  # first half takes the extra row when odd
-            return self.run(texts[:mid]) + self.run(texts[mid:])
+            return self.run(texts[:mid], _top_level=False) + self.run(texts[mid:], _top_level=False)
 
         if kind.retryable:
             delay = classifier.retry_delay

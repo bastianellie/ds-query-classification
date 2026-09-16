@@ -232,6 +232,16 @@ python classify.py \
 | `--batch-max-input-tokens` | Override the resolved input token budget used to size batches. Requires `--batch`. |
 | `--batch-max-output-tokens` | Override the resolved output token budget used as a runaway-response guard. Requires `--batch`. |
 
+## Cost and timing
+
+Every run now writes a `cost_report.json` alongside its usual output —
+`{output-stem}.cost_report.json` for `classify.py`, `{run-dir}/cost_report.json` for
+`experiment.py` — recording estimated total cost, per-query/per-batch cost statistics, and
+wall-clock time. Figures are estimates based on LiteLLM's bundled pricing table, not billing
+records. Under `--critics`/`--models`/`--batch`, per-query cost is approximated (an even split
+of the phase's total spend), not attributed exactly per row — see
+`spec/7-cost-and-timing-logging/spec.md` for the full field shape and estimation rules.
+
 ## Cerebus / Portkey gateway
 
 Both entry points (`classify.py` and `experiment.py`) can route every LLM call through

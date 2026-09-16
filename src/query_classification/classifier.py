@@ -9,13 +9,38 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
-from typing import Any, NamedTuple
+from contextlib import contextmanager
+from typing import Any, Iterator, NamedTuple
 
 import litellm
 from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger(__name__)
+
+# Per-thread active track_usage() sink, if any -- module-level (not per-instance)
+# because only one track_usage() scope is ever active per thread at a time in
+# this codebase's actual call sites (pipeline.py's plain-mode wrapper,
+# BatchRunner's top-level call). See Classifier.track_usage().
+_thread_local = threading.local()
+
+
+class _UsageSink:
+    """Accumulates usage for the single classify() call(s) made inside one
+    ``with classifier.track_usage() as sink:`` block on the thread that
+    created it. ``usage`` is ``None`` until at least one response-producing
+    completion attempt is captured."""
+
+    def __init__(self) -> None:
+        self.usage: tuple[int, int] | None = None
+
+    def _add(self, prompt_tokens: int, completion_tokens: int) -> None:
+        if self.usage is None:
+            self.usage = (prompt_tokens, completion_tokens)
+        else:
+            p, c = self.usage
+            self.usage = (p + prompt_tokens, c + completion_tokens)
 
 # Common env vars that hold an endpoint/base URL, in priority order. litellm has
 # no single "endpoint" key shared across providers, so we bridge the most common
@@ -463,6 +488,56 @@ class Classifier:
         # set explicitly (spec 5, FR-2.5), never sized to squeeze a response, so no
         # existing unbatched call site changes behavior by leaving it unset.
         self.max_tokens = max_tokens
+        self._usage_lock = threading.Lock()
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
+
+    def usage_totals(self) -> tuple[int, int]:
+        """(prompt_tokens, completion_tokens) accumulated across every real
+        completion call this instance has made, regardless of whether a
+        ``track_usage()`` context was active for any of them."""
+        with self._usage_lock:
+            return (self._total_prompt_tokens, self._total_completion_tokens)
+
+    @contextmanager
+    def track_usage(self) -> Iterator[_UsageSink]:
+        """Context manager: ``with classifier.track_usage() as sink:
+        classifier.classify(text)``, then read ``sink.usage ->
+        tuple[int, int] | None``. ``classify()``'s own call signature and
+        arguments are never touched -- this simply makes a thread-local sink
+        available for ``_capture_usage_from_response`` to feed while the
+        block is active. Not expected to nest in practice, but the previous
+        sink (if any) is saved and restored regardless."""
+        sink = _UsageSink()
+        previous = getattr(_thread_local, "sink", None)
+        _thread_local.sink = sink
+        try:
+            yield sink
+        finally:
+            _thread_local.sink = previous
+
+    def _capture_usage_from_response(self, response: Any) -> None:
+        """Called once, at the single point ``_attempt_completion`` obtains a
+        response worth reading -- immediately before ``_extract_content``.
+        Reads ``getattr(response, "usage", None)``; if both
+        ``prompt_tokens``/``completion_tokens`` are present and not ``None``,
+        adds them to this instance's running total and, if a
+        ``track_usage()`` context is active on this thread, to that sink too.
+        A response with no usable usage contributes nothing to either --
+        never an error."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        if prompt_tokens is None or completion_tokens is None:
+            return
+        with self._usage_lock:
+            self._total_prompt_tokens += prompt_tokens
+            self._total_completion_tokens += completion_tokens
+        sink = getattr(_thread_local, "sink", None)
+        if sink is not None:
+            sink._add(prompt_tokens, completion_tokens)
 
     def _completion_kwargs(self, messages: list[dict]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"model": self.model_id, "messages": messages}
@@ -534,6 +609,7 @@ class Classifier:
             raise
         except litellm.BadRequestError as exc:
             response = self._fallback_completion(kwargs, exc)
+        self._capture_usage_from_response(response)
         return _extract_content(response)
 
     def _fallback_completion(

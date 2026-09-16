@@ -623,6 +623,103 @@ def test_run_single_row_failure_returns_exception_without_raising(monkeypatch):
     assert isinstance(results[0], Exception)
 
 
+# ---------------------------------------------------------------------------
+# Spec 7 / FR-3.2 / FR-3.4 / AR-3.1: per-batch cost via BatchStats/BatchRunner
+# ---------------------------------------------------------------------------
+
+
+class _FakeUsage:
+    def __init__(self, prompt_tokens, completion_tokens):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+def _completion_with_usage(prompt_tokens=10, completion_tokens=5):
+    def fake_completion(**kwargs):
+        user_content = kwargs["messages"][-1]["content"]
+        arity = user_content.count('"position"')
+
+        class _Msg:
+            content = _valid_batch_content(arity)
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = _FakeUsage(prompt_tokens, completion_tokens)
+
+        return _Resp()
+
+    return fake_completion
+
+
+def _flat_cost_fn(prompt_tokens, completion_tokens):
+    return prompt_tokens * 0.01 + completion_tokens * 0.02
+
+
+def test_run_records_cost_of_only_the_first_top_level_attempt(monkeypatch):
+    runner, stats = _runner_with_fake_completion(
+        monkeypatch, _completion_with_usage(10, 5), cost_fn=_flat_cost_fn
+    )
+    runner.run(["a", "b", "c"])
+    batch_costs = stats.snapshot()["batch_costs"]
+    assert batch_costs == [(3, 10 * 0.01 + 5 * 0.02)]
+
+
+def test_run_with_no_cost_fn_records_no_batch_costs(monkeypatch):
+    runner, stats = _runner_with_fake_completion(monkeypatch, _completion_with_usage())
+    runner.run(["a", "b", "c"])
+    assert stats.snapshot()["batch_costs"] == []
+
+
+def test_bisected_batch_only_first_attempts_cost_appears_in_batch_costs(monkeypatch):
+    calls = []
+    runner, stats = _runner_with_fake_completion(
+        monkeypatch, _bad_row_completion(calls), cost_fn=_flat_cost_fn
+    )
+    texts = ["ok1", "ok2", "ok3", "BAD_ROW", "ok4", "ok5", "ok6", "ok7"]
+    runner.run(texts)
+    batch_costs = stats.snapshot()["batch_costs"]
+    # Only the top-level call's first attempt is recorded -- the bisection's
+    # own recursive calls (which pass _top_level=False) never call record_cost.
+    assert len(batch_costs) == 1
+    assert batch_costs[0][0] == 8
+
+
+def test_total_usage_sums_usage_across_every_cached_arity_classifier(monkeypatch):
+    runner, stats = _runner_with_fake_completion(
+        monkeypatch, _completion_with_usage(10, 5), cost_fn=_flat_cost_fn
+    )
+    runner.run(["a", "b"])
+    runner.run(["c", "d", "e"])
+    # Two distinct arities (2 and 3) were used, one top-level call each.
+    assert runner.total_usage() == (20, 10)
+
+
+def test_run_default_top_level_argument_behaves_exactly_as_before(monkeypatch):
+    def fake_completion(**kwargs):
+        user_content = kwargs["messages"][-1]["content"]
+        arity = user_content.count('"position"')
+
+        class _Msg:
+            content = _valid_batch_content(arity)
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    runner, stats = _runner_with_fake_completion(monkeypatch, fake_completion)
+    results = runner.run(["a", "b", "c"])
+    assert results == [{"c": ["x"]}, {"c": ["x"]}, {"c": ["x"]}]
+
+
 def test_concurrent_misses_build_exactly_one_classifier_per_arity(monkeypatch):
     import threading
     import litellm
@@ -982,3 +1079,216 @@ def test_classify_csv_batch_runner_with_models_raises_value_error(monkeypatch, t
     df.to_csv(input_path, index=False)
     with pytest.raises(ValueError):
         classify_csv(input_path, "text", None, categories, output_path=tmp_path / "out.csv", batch_runner=runner, models=models)
+
+
+# ---------------------------------------------------------------------------
+# Spec 7 / FR-1.2 / FR-3.1 / FR-3.3: classify_csv's cost_collector plumbing
+# ---------------------------------------------------------------------------
+
+from query_classification import cost as cost_module  # noqa: E402
+
+
+class _FakeUsageForPipeline:
+    def __init__(self, prompt_tokens, completion_tokens):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+def _plain_completion_with_known_usage(monkeypatch, usage_by_text):
+    import litellm
+
+    def fake_completion(**kwargs):
+        text = kwargs["messages"][-1]["content"]
+        prompt_tokens, completion_tokens = usage_by_text[text]
+
+        class _Msg:
+            content = json.dumps({"c": ["x"]})
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = _FakeUsageForPipeline(prompt_tokens, completion_tokens)
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+
+
+_FLAT_CPT = cost_module.CostPerToken(
+    input=0.01, output=0.02, resolved_input_model="m", resolved_output_model="m"
+)
+
+
+def test_classify_csv_plain_mode_records_exact_per_row_costs(monkeypatch, tmp_path):
+    cat = _category()
+    texts = [f"query {i}" for i in range(10)]
+    usage_by_text = {t: (i + 1, i + 1) for i, t in enumerate(texts, start=0)}
+    _plain_completion_with_known_usage(monkeypatch, usage_by_text)
+    row_model = build_classification_model([cat])
+    plain_classifier = Classifier(model_id="openai/gpt-4o-mini", system_prompt="sp", classification_model=row_model)
+
+    df = pd.DataFrame({"text": texts})
+    input_path = tmp_path / "in.csv"
+    df.to_csv(input_path, index=False)
+
+    collector = cost_module.QueryCostCollector()
+    classify_csv(
+        input_path, "text", plain_classifier, [cat],
+        output_path=tmp_path / "out.csv",
+        cost_collector=collector,
+        cost_per_token=_FLAT_CPT,
+    )
+    expected = sorted(cost_module.compute_cost(p, c, _FLAT_CPT) for p, c in usage_by_text.values())
+    assert sorted(collector.samples()) == expected
+    assert collector.rows_attempted() == 10
+
+
+def test_classify_csv_plain_mode_without_cost_collector_is_byte_identical(monkeypatch, tmp_path):
+    cat = _category()
+    texts = [f"query {i}" for i in range(5)]
+    usage_by_text = {t: (1, 1) for t in texts}
+    _plain_completion_with_known_usage(monkeypatch, usage_by_text)
+    row_model = build_classification_model([cat])
+    plain_classifier = Classifier(model_id="openai/gpt-4o-mini", system_prompt="sp", classification_model=row_model)
+
+    df = pd.DataFrame({"text": texts})
+    input_path_a = tmp_path / "in_a.csv"
+    input_path_b = tmp_path / "in_b.csv"
+    df.to_csv(input_path_a, index=False)
+    df.to_csv(input_path_b, index=False)
+
+    out_a = classify_csv(input_path_a, "text", plain_classifier, [cat], output_path=tmp_path / "out_a.csv")
+    out_b = classify_csv(
+        input_path_b, "text", plain_classifier, [cat],
+        output_path=tmp_path / "out_b.csv", cost_collector=None,
+    )
+    assert out_a.read_bytes() == out_b.read_bytes()
+
+
+def test_classify_csv_plain_mode_failure_after_response_still_contributes_cost(monkeypatch, tmp_path):
+    import litellm
+
+    cat = _category()
+    texts = ["good", "bad"]
+
+    def fake_completion(**kwargs):
+        text = kwargs["messages"][-1]["content"]
+
+        class _Msg:
+            content = json.dumps({"c": ["x"]} if text == "good" else {"bogus": "y"})
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = _FakeUsageForPipeline(10, 5)
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    row_model = build_classification_model([cat])
+    plain_classifier = Classifier(
+        model_id="openai/gpt-4o-mini", system_prompt="sp", classification_model=row_model,
+        max_retries=1, retry_delay=0.0,
+    )
+
+    df = pd.DataFrame({"text": texts})
+    input_path = tmp_path / "in.csv"
+    df.to_csv(input_path, index=False)
+
+    collector = cost_module.QueryCostCollector()
+    classify_csv(
+        input_path, "text", plain_classifier, [cat],
+        output_path=tmp_path / "out.csv",
+        cost_collector=collector,
+        cost_per_token=_FLAT_CPT,
+    )
+    samples = collector.samples()
+    assert len(samples) == 2  # both rows produced a response-carrying attempt
+    assert all(s is not None for s in samples)
+    assert collector.rows_attempted() == 2
+
+
+def test_classify_csv_plain_mode_zero_billable_attempt_failure_excluded_not_poisoned(monkeypatch, tmp_path):
+    import litellm
+
+    cat = _category()
+    texts = ["good1", "immediate_failure", "good2"]
+
+    def fake_completion(**kwargs):
+        text = kwargs["messages"][-1]["content"]
+        if text == "immediate_failure":
+            raise litellm.AuthenticationError(message="bad key", model="m", llm_provider="openai")
+
+        class _Msg:
+            content = json.dumps({"c": ["x"]})
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = _FakeUsageForPipeline(10, 5)
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    row_model = build_classification_model([cat])
+    plain_classifier = Classifier(model_id="openai/gpt-4o-mini", system_prompt="sp", classification_model=row_model)
+
+    df = pd.DataFrame({"text": texts})
+    input_path = tmp_path / "in.csv"
+    df.to_csv(input_path, index=False)
+
+    collector = cost_module.QueryCostCollector()
+    classify_csv(
+        input_path, "text", plain_classifier, [cat],
+        output_path=tmp_path / "out.csv",
+        cost_collector=collector,
+        cost_per_token=_FLAT_CPT,
+    )
+    samples = collector.samples()
+    assert len(samples) == 2  # the zero-billable-attempt failure contributes nothing
+    assert all(s is not None for s in samples)
+    stats = cost_module.stats_from_samples(samples)
+    assert stats["mean_usd"] is not None  # not poisoned to None by the excluded row
+    assert collector.rows_attempted() == 3  # but rows_attempted still reflects all 3
+
+
+def test_classify_csv_critics_mode_sets_rows_attempted(monkeypatch, tmp_path):
+    import query_classification.debate as debate_module
+
+    cat = _category()
+    row_model = build_classification_model([cat])
+    sampling_classifier = Classifier(model_id="openai/gpt-4o-mini", system_prompt="sp", classification_model=row_model)
+    critic_classifiers = {cat.name: Classifier(model_id="openai/gpt-4o-mini", system_prompt="sp", classification_model=row_model)}
+    reconciler_classifiers = {cat.name: Classifier(model_id="openai/gpt-4o-mini", system_prompt="sp", classification_model=row_model)}
+
+    def fake_run_debate(text, categories, classifier, critics, reconcilers, **kwargs):
+        return {cat.name: ["x"]}
+
+    monkeypatch.setattr(debate_module, "run_debate", fake_run_debate)
+    import query_classification.pipeline as pipeline_module
+    monkeypatch.setattr(pipeline_module.debate, "run_debate", fake_run_debate)
+
+    df = pd.DataFrame({"text": ["a", "b", "c"]})
+    input_path = tmp_path / "in.csv"
+    df.to_csv(input_path, index=False)
+
+    collector = cost_module.QueryCostCollector()
+    classify_csv(
+        input_path, "text", sampling_classifier, [cat],
+        output_path=tmp_path / "out.csv",
+        critics=True,
+        critic_classifiers=critic_classifiers,
+        reconciler_classifiers=reconciler_classifiers,
+        cost_collector=collector,
+    )
+    assert collector.rows_attempted() == 3
+    assert collector.samples() == []  # critics mode never records per-row samples
