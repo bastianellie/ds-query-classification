@@ -1,5 +1,9 @@
 # Spec 7: Cost and Timing Logging
 
+> **Status: CLOSED** — Implemented and verified on 2026-09-16.
+> Implementation summary: `spec/7-cost-and-timing-logging/implementation-summary.md`
+> Merged from worktree branch `spec/7-cost-and-timing-logging` on 2026-09-16.
+
 ## Overview
 
 Every run of `experiment.py` or `classify.py`/`cli.py` currently reports whether it succeeded
