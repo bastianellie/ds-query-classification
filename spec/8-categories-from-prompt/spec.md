@@ -1,5 +1,9 @@
 # Spec 8: Categories From Prompt
 
+> **Status: CLOSED** — Implemented and verified on 2026-09-17.
+> Implementation summary: `spec/8-categories-from-prompt/implementation-summary.md`
+> Merged from worktree branch `spec/8-categories-from-prompt` on 2026-09-17.
+
 ## Overview
 
 Add a new, standalone entry point that turns a single free-text instruction file into a
