@@ -371,6 +371,32 @@ any other untrusted CSV before opening it that way.
 reads `--critics`-specific columns (`_initial`/`_votes`/`_challenged`/
 `_reconciled`) and cannot analyze a multi-classifier run's output as-is.
 
+## Extracting categories from a prompt
+
+If you already know, in plain English, what a category's labels should be but don't have a
+labeled dataset to run the experiment runner's `induce` subcommand against, `extract_categories.py`
+turns a short instruction file directly into a `categories.json`, via one LLM call:
+
+```bash
+python extract_categories.py \
+  --prompt-file instructions.txt \
+  --category-name sentiment \
+  --output categories.json
+```
+
+`instructions.txt` might read: *"Classify the overall sentiment of a message as positive,
+negative, or neutral."* The tool sends that text to the LLM, which invents the label values and
+descriptions; `--category-name` (required) becomes the output `Category.name` — the LLM never
+invents this itself. `--output` defaults to `categories.json` in the current directory and
+refuses to overwrite an existing file unless `--overwrite` is given. `--model`/`--retries`/
+`--cerebus`/`--api-base` work the same as on `classify.py`/`experiment.py`. Run
+`python extract_categories.py --help` for the full flag list.
+
+This is a standalone tool today — it does not read from or write into `experiment.py`'s
+`--run-dir`, and neither entry point calls it. Wiring it into `experiment.py`'s `induce`/`run`
+flow (e.g. as an alternative to labeled-data induction) is a deliberate, staged next step, not
+yet built.
+
 ## Defining categories
 
 ```json

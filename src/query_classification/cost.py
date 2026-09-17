@@ -1,7 +1,9 @@
 """Cost and timing primitives (spec 7): per-model pricing resolution, cost
 arithmetic, sample statistics, a live-readable timer, and an atomic JSON
-writer. Owns every pure/reusable primitive the two entry points
-(`experiment.py`/`cli.py`) need to assemble a `cost_report.json`.
+writer. Owns every pure/reusable primitive `experiment.py`/`cli.py` need to
+assemble a `cost_report.json`; its atomic writer, `write_json_atomic`, is
+also reused by a third module, `category_extraction.py` (spec 8), to write
+its own `categories.json` output.
 
 Per INV-1, this module may import `categories.py`/`classifier.py` only -- it
 must not import `pipeline.py`, `batching.py`, `debate.py`, `multi_model.py`,

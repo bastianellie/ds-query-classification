@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
-from query_classification.categories import Category
+from query_classification.categories import Category, Label
 
 
 def build_classification_model(
@@ -181,6 +181,41 @@ def build_batch_model(row_model: type[BaseModel], n: int) -> type[BaseModel]:
         f"result_{i}": (strict_row_model, ...) for i in range(1, n + 1)
     }
     return create_model("BatchClassificationResult", __config__=ConfigDict(extra="forbid"), **fields)
+
+
+def build_category_extraction_model() -> type[BaseModel]:
+    """Build the output schema for the prompt-based category-extraction call
+    (spec 8): a ``category_description`` plus an open-ended ``labels`` list,
+    each entry a ``{value, description}`` pair the LLM invents from a
+    free-text instruction -- unlike ``build_induction_model``, this schema's
+    shape never varies by call site (no ``n_labels`` argument), since there
+    is no pre-existing label set to pin the arity to.
+
+    ``labels`` is a plain, length-unconstrained list -- verified against the
+    installed stack: litellm's strict structured-output mode rejects
+    ``minItems``/``maxItems`` (see ``build_induction_model``'s own note), but
+    imposes no such restriction on an unbounded list, so this schema can use
+    ``list[...]`` directly instead of ``build_induction_model``'s positional-
+    field workaround.
+
+    Each label entry is typed as a **strict local copy** of
+    ``categories.Label``'s shape (``extra="forbid"``), not ``Label`` itself --
+    mirroring ``build_batch_model``'s own ``f"{row_model.__name__}Strict"``
+    pattern. Plain ``Label`` carries no ``extra="forbid"`` of its own, so an
+    outer ``extra="forbid"`` alone would not reject an extra/unexpected field
+    nested inside one label entry (verified live: such a field is silently
+    discarded, not rejected, without this local strict copy). This never
+    modifies the shared ``categories.Label`` class itself.
+    """
+    label_strict = create_model(
+        "LabelStrict", __base__=Label, __config__=ConfigDict(extra="forbid")
+    )
+    return create_model(
+        "CategoryExtractionResult",
+        __config__=ConfigDict(extra="forbid"),
+        category_description=(str, ...),
+        labels=(list[label_strict], ...),
+    )
 
 
 def schema_description(model: type[BaseModel]) -> str:

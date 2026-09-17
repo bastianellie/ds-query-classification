@@ -19,6 +19,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from query_classification.resources import (
+    DEFAULT_CATEGORY_EXTRACTION_PROMPT_FILE,
     DEFAULT_CRITIC_PROMPT_FILE,
     DEFAULT_INDUCTION_PROMPT_FILE,
     DEFAULT_RECONCILER_PROMPT_FILE,
@@ -109,5 +110,18 @@ def build_induction_prompt(
     once, generically, while the actual labels/examples for a given dataset are
     per-call data assembled into the user message by a different module. The
     template has no placeholders, so no ``.format()`` call is needed here.
+    """
+    return Path(system_prompt_file).read_text()
+
+
+def build_category_extraction_prompt(
+    system_prompt_file: str | Path = DEFAULT_CATEGORY_EXTRACTION_PROMPT_FILE,
+) -> str:
+    """Render the category-extraction system prompt (spec 8).
+
+    Identical zero-placeholder shape to ``build_induction_prompt``: the
+    instruction text being extracted from is per-call data assembled into the
+    user message by ``category_extraction.py``, not templated into this
+    system prompt.
     """
     return Path(system_prompt_file).read_text()

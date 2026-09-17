@@ -19,6 +19,7 @@ EXAMPLE_TASK_DESCRIPTION_FILE = RESOURCES_DIR / "prompts" / "example_task_descri
 DEFAULT_CRITIC_PROMPT_FILE = RESOURCES_DIR / "prompts" / "critic_prompt.txt"
 DEFAULT_RECONCILER_PROMPT_FILE = RESOURCES_DIR / "prompts" / "reconciler_prompt.txt"
 DEFAULT_INDUCTION_PROMPT_FILE = RESOURCES_DIR / "prompts" / "induction_prompt.txt"
+DEFAULT_CATEGORY_EXTRACTION_PROMPT_FILE = RESOURCES_DIR / "prompts" / "category_extraction_prompt.txt"
 
 
 def check_default_resources_available() -> None:
