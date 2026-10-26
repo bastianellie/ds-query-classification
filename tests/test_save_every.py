@@ -189,3 +189,104 @@ def test_batch_and_plain_runs_write_the_same_number_of_times_for_small_batches(
     plain_count = len(_output_writes(writes, plain_out))
     batch_out = _batch_run(monkeypatch, tmp_path, writes, rows=60, fixed_size=7, save_every=20)
     assert len(_output_writes(writes, batch_out)) == plain_count
+
+
+# --- Task 2: the --save-every CLI flag ----------------------------------------
+
+import sys  # noqa: E402
+
+from query_classification import cli, table_io  # noqa: E402
+from query_classification.classifier import Classifier  # noqa: E402
+
+
+@pytest.fixture
+def cli_run(tmp_path, monkeypatch):
+    """Runs `cli.main` with a faked `Classifier.classify` (no provider call)."""
+    monkeypatch.setattr("query_classification.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.delenv("DEFAULT_LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(Classifier, "classify", lambda self, text: {"c": ["x"]})
+    cats = tmp_path / "cats.json"
+    cats.write_text(
+        '{"categories": [{"name": "c", "description": "d", '
+        '"labels": [{"value": "x", "description": "d"}]}]}'
+    )
+
+    def run(*args):
+        monkeypatch.setattr(sys, "argv", ["classify.py", "--categories", str(cats), *map(str, args)])
+        cli.main()
+
+    return run
+
+
+def test_parser_default_is_20_and_value_is_parsed():
+    base = ["-i", "a.csv", "-c", "text"]
+    assert cli.build_parser().parse_args(base).save_every == 20
+    assert cli.build_parser().parse_args([*base, "--save-every", "5000"]).save_every == 5000
+
+
+def test_non_integer_save_every_is_an_argparse_error(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args(["-i", "a.csv", "-c", "text", "--save-every", "abc"])
+    assert exc.value.code == 2
+    assert "--save-every" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["0", "-5"])
+def test_cli_rejects_save_every_below_one_before_any_classifier_is_built(
+    tmp_path, monkeypatch, capsys, cli_run, bad
+):
+    built = []
+    monkeypatch.setattr(Classifier, "__init__", lambda self, *a, **k: built.append(1))
+    src = _csv(tmp_path / "in.csv", text=["a"])
+    with pytest.raises(SystemExit) as exc:
+        # no --output: without the early check the in-place OVERWRITTEN warning would print
+        cli_run("-i", src, "-c", "text", "--save-every", bad)
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert f"--save-every must be >= 1, got {bad}" in out and "OVERWRITTEN" not in out
+    assert built == []
+
+
+def test_cli_passes_save_every_through_to_classify_csv(tmp_path, monkeypatch, writes, cli_run):
+    seen = []
+    real = cli.classify_csv
+
+    def recorder(*args, **kwargs):
+        seen.append(kwargs.get("save_every"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "classify_csv", recorder)
+    src = _csv(tmp_path / "in.csv", text=[f"q{i}" for i in range(7)])
+    out = tmp_path / "out.csv"
+    writes.clear()
+    cli_run("-i", src, "-c", "text", "-o", out, "--workers", 1, "--save-every", 3)
+    assert seen == [3]
+    assert _output_writes(writes, out) == [3, 6, 7]  # interim at 3 and 6, then the final write
+
+    seen.clear()
+    cli_run("-i", src, "-c", "text", "-o", tmp_path / "default.csv", "--workers", 1)
+    assert seen == [20]  # flag omitted -> today's default
+
+
+def test_cli_xlsx_export_happens_once_after_the_final_csv_write(tmp_path, monkeypatch, cli_run):
+    events = []
+    out = tmp_path / "out.csv"
+    real_to_csv = pd.DataFrame.to_csv
+    real_write_xlsx = table_io.write_xlsx
+
+    def spy_to_csv(self, path_or_buf=None, *args, **kwargs):
+        if path_or_buf is not None and Path(path_or_buf) == out:
+            events.append("csv")
+        return real_to_csv(self, path_or_buf, *args, **kwargs)
+
+    def spy_write_xlsx(*args, **kwargs):
+        events.append("xlsx")
+        return real_write_xlsx(*args, **kwargs)
+
+    src = _csv(tmp_path / "in.csv", text=[f"q{i}" for i in range(6)])
+    monkeypatch.setattr(pd.DataFrame, "to_csv", spy_to_csv)
+    monkeypatch.setattr(table_io, "write_xlsx", spy_write_xlsx)
+    cli_run("-i", src, "-c", "text", "-o", out, "--workers", 1, "--save-every", 2,
+            "--output-format", "xlsx")
+    assert events == ["csv", "csv", "csv", "csv", "xlsx"]  # 3 interim + final, then one export
+    assert (tmp_path / "out.xlsx").exists()

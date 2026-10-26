@@ -23,7 +23,7 @@ from query_classification.classifier import (
     cerebus_model_id,
     reject_insecure_cerebus_endpoint,
 )
-from query_classification.pipeline import classify_csv
+from query_classification.pipeline import classify_csv, validate_save_every
 from query_classification.prompts import (
     build_critic_prompt,
     build_reconciler_prompt,
@@ -153,6 +153,16 @@ def build_parser() -> argparse.ArgumentParser:
         "Use 1 to limit row-level concurrency to one row at a time (with "
         "--critics, that row's own sampling calls still run concurrently with "
         "each other, so this no longer means zero concurrency overall).",
+    )
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Rewrite the output CSV every N completed rows (default: 20). Each save "
+        "rewrites the whole file, so for inputs of hundreds of thousands of rows use a "
+        "larger value such as 5000; a crash then loses the rows completed since the "
+        "last save (with --batch, saves happen at most once per batch). Must be >= 1.",
     )
     parser.add_argument(
         "--critics",
@@ -514,6 +524,7 @@ def main() -> None:
         # is constructed and before the in-place overwrite warning below.
         table_io.validate_options(args.input, args.output, args.sheet, args.output_format)
         keep_columns = table_io.parse_keep_columns(args.keep_columns)
+        validate_save_every(args.save_every)  # spec 10: same data-free placement
 
         if args.critics and not math.isfinite(args.sampling_temperature):
             raise ValueError(
@@ -792,6 +803,7 @@ def main() -> None:
                 sheet=args.sheet,
                 keep_columns=keep_columns,
                 output_format=args.output_format,
+                save_every=args.save_every,
             )
         except table_io.ExcelExportError as exc:
             export_error = exc
