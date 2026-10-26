@@ -52,6 +52,16 @@ def _export_xlsx(df: pd.DataFrame, output_path: Path, output_format: str) -> Non
         table_io.write_xlsx(df, output_path.with_suffix(".xlsx"), output_path)
 
 
+def validate_save_every(value: object) -> None:
+    """Reject a ``save_every`` that is not a positive integer (spec 10 FR-1.2/1.4).
+
+    ``bool`` is excluded explicitly: ``isinstance(True, int)`` is true in Python,
+    but ``save_every=True`` is never what a caller means.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"--save-every must be >= 1, got {value}")
+
+
 def classify_csv(
     input_path: str | Path,
     column: str,
@@ -83,7 +93,10 @@ def classify_csv(
     I/O-bound). Results are written back by row index, so the output preserves
     the original input order regardless of completion order. The CSV is flushed
     to disk every ``save_every`` completed rows (and once at the end) so a
-    crashed run can be resumed with ``restore``.
+    crashed run can be resumed with ``restore``. Under ``batch_runner`` the
+    flush happens at most once per consumed batch, when the completed count
+    crossed a multiple of ``save_every`` during that batch. ``save_every`` must
+    be a positive integer.
 
     Exactly one of ``classifier`` or ``models`` must be given. When
     ``critics=True``, ``classifier`` is used as the *sampling* classifier
@@ -109,6 +122,7 @@ def classify_csv(
     Returns the path the CSV result was written to. Defaults to overwriting
     the input file when ``output_path`` is not given (CSV input only).
     """
+    validate_save_every(save_every)
     input_path = Path(input_path)
     requested_output = output_path
     output_path = Path(output_path) if output_path else input_path
@@ -309,6 +323,7 @@ def classify_csv(
             }
             for future in as_completed(future_to_batch_idx):
                 batch_idx = future_to_batch_idx[future]
+                completed_before = completed
                 try:
                     outcomes = future.result()
                 except Exception as exc:  # noqa: BLE001 - the batching layer's own code
@@ -327,8 +342,11 @@ def classify_csv(
                     completed += 1
                     progress.update(1)
                     progress.set_postfix(ok=classified, failed=failed)
-                    if completed % save_every == 0:
-                        df.to_csv(output_path, index=False)
+                # At most one interim write per consumed batch (spec 10 FR-2.1): a
+                # batch can span several multiples of save_every, and rewriting the
+                # whole file for each would multiply the cost for no extra safety.
+                if completed // save_every > completed_before // save_every:
+                    df.to_csv(output_path, index=False)
             df.to_csv(output_path, index=False)
             progress.close()
             _export_xlsx(df, output_path, output_format)
