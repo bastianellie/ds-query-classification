@@ -1,5 +1,9 @@
 # Spec 9: Excel Input, Column Selection, and Optional Excel Output
 
+> **Status: CLOSED** — Implemented and verified on 2026-10-26.
+> Implementation summary: `spec/9-excel-input-output/implementation-summary.md`
+> Merged from worktree branch `spec/9-excel-input-output` on 2026-10-26.
+
 ## Overview
 
 `classify.py` reads only CSV files (`pd.read_csv(input_path)`, `pipeline.py:179`), but the logs
