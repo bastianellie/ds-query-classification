@@ -13,7 +13,7 @@ from pathlib import Path
 import litellm
 from dotenv import load_dotenv
 
-from query_classification import cost
+from query_classification import cost, table_io
 from query_classification.batching import BatchRunner, BatchStats, resolve_token_budgets
 from query_classification.categories import load_categories
 from query_classification.classifier import (
@@ -55,15 +55,38 @@ _DEFAULT_BATCH_MAX_SIZE = 50
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Classify text from a CSV column against user-defined categories using an LLM.",
+        description="Classify text from a CSV or Excel column against user-defined categories using an LLM.",
     )
-    parser.add_argument("-i", "--input", required=True, help="Path to input CSV file")
+    parser.add_argument(
+        "-i", "--input", required=True, help="Path to input file: CSV, or Excel (.xlsx/.xlsm)"
+    )
     parser.add_argument("-c", "--column", required=True, help="Column name to classify")
     parser.add_argument(
         "-o",
         "--output",
         metavar="FILE",
-        help="Path to output CSV file (default: overwrite input)",
+        help="Path to output CSV file (default: overwrite input; required for Excel input, "
+        "and must always name a CSV -- see --output-format for an .xlsx copy)",
+    )
+    parser.add_argument(
+        "--sheet",
+        metavar="NAME_OR_INDEX",
+        help="Excel input only: worksheet to read, by exact name or zero-based index "
+        "(default: the first sheet)",
+    )
+    parser.add_argument(
+        "--keep-columns",
+        metavar="COL1,COL2,...",
+        help="Comma-separated input columns to carry into the output (the --column text "
+        "column is always kept; default: all input columns). Dropped columns are never "
+        "written to the output. Names containing commas cannot be selected.",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=table_io.OUTPUT_FORMATS,
+        default="csv",
+        help="'csv' (default) writes only the CSV. 'xlsx' additionally writes an .xlsx "
+        "copy next to the CSV once the run finishes; the CSV stays the file --restore reads.",
     )
     parser.add_argument(
         "--categories",
@@ -487,6 +510,11 @@ def main() -> None:
         if uses_bundled_defaults:
             check_default_resources_available()
 
+        # Data-free input/output option checks (spec 9): fail before any client
+        # is constructed and before the in-place overwrite warning below.
+        table_io.validate_options(args.input, args.output, args.sheet, args.output_format)
+        keep_columns = table_io.parse_keep_columns(args.keep_columns)
+
         if args.critics and not math.isfinite(args.sampling_temperature):
             raise ValueError(
                 f"--sampling-temperature must be a finite number, got "
@@ -738,26 +766,35 @@ def main() -> None:
                 "results are not directly comparable to an unbatched run."
             )
 
-        classify_csv(
-            input_path=args.input,
-            column=args.column,
-            classifier=classifier,
-            categories=categories,
-            output_path=args.output,
-            restore=args.restore,
-            limit=args.limit,
-            workers=args.workers,
-            critics=args.critics,
-            critic_classifiers=critic_classifiers,
-            reconciler_classifiers=reconciler_classifiers,
-            sampling_runs=args.sampling_runs,
-            consensus_threshold=args.consensus_threshold,
-            allow_new_labels=allow_new_labels,
-            models=models_classifiers,
-            batch_runner=batch_runner,
-            cost_collector=query_cost_collector,
-            cost_per_token=single_model_cost_per_token,
-        )
+        # An Excel-export failure is held until the cost report is written: the
+        # classified CSV is already on disk and the run's cost is still real.
+        export_error: table_io.ExcelExportError | None = None
+        try:
+            classify_csv(
+                input_path=args.input,
+                column=args.column,
+                classifier=classifier,
+                categories=categories,
+                output_path=args.output,
+                restore=args.restore,
+                limit=args.limit,
+                workers=args.workers,
+                critics=args.critics,
+                critic_classifiers=critic_classifiers,
+                reconciler_classifiers=reconciler_classifiers,
+                sampling_runs=args.sampling_runs,
+                consensus_threshold=args.consensus_threshold,
+                allow_new_labels=allow_new_labels,
+                models=models_classifiers,
+                batch_runner=batch_runner,
+                cost_collector=query_cost_collector,
+                cost_per_token=single_model_cost_per_token,
+                sheet=args.sheet,
+                keep_columns=keep_columns,
+                output_format=args.output_format,
+            )
+        except table_io.ExcelExportError as exc:
+            export_error = exc
 
         cost_report = _assemble_cost_report(
             classifier, critic_classifiers, reconciler_classifiers, models_classifiers,
@@ -774,6 +811,8 @@ def main() -> None:
             else "unknown"
         )
         print(f"Cost: {cost_str} | Time: {cost_report['wall_clock_seconds']:.1f}s")
+        if export_error is not None:
+            raise export_error
     except (ValueError, FileNotFoundError, RuntimeError) as e:
         print(f"Error: {e}")
         sys.exit(1)

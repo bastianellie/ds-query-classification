@@ -222,6 +222,7 @@ def write_xlsx(df: pd.DataFrame, path: str | Path, csv_path: str | Path) -> Path
     """
     path = Path(path)
     tmp_name: str | None = None
+    workbook = None
     try:
         _require_openpyxl()
         from openpyxl import Workbook
@@ -249,6 +250,11 @@ def write_xlsx(df: pd.DataFrame, path: str | Path, csv_path: str | Path) -> Path
             print(f"Excel export: sanitized {counter[0]} cells")
         return path
     except Exception as exc:  # noqa: BLE001 - any export failure keeps the CSV and exits 1
+        if workbook is not None:
+            try:
+                workbook.close()  # releases the write-only workbook's scratch files
+            except Exception:  # noqa: BLE001 - best-effort cleanup must not mask the real error
+                pass
         if tmp_name is not None:
             try:
                 os.unlink(tmp_name)

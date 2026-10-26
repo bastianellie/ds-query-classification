@@ -532,3 +532,119 @@ def test_invalid_output_format_is_rejected(tmp_path):
     src = _csv(tmp_path / "in.csv", text=["a"])
     with pytest.raises(ValueError, match="--output-format"):
         classify_csv(src, "text", _FakeClassifier(), CATS, output_path=tmp_path / "o.csv", output_format="parquet")
+
+
+# --- Task 3: CLI flags -------------------------------------------------------
+
+import json  # noqa: E402
+
+from query_classification import cli  # noqa: E402
+from query_classification.classifier import Classifier  # noqa: E402
+
+
+@pytest.fixture
+def cli_env(tmp_path, monkeypatch):
+    """Runs `cli.main` with a faked `Classifier.classify` (no provider call)."""
+    monkeypatch.setattr("query_classification.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.delenv("DEFAULT_LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(Classifier, "classify", lambda self, text: {"c": ["x"]})
+    cats = tmp_path / "cats.json"
+    cats.write_text(
+        '{"categories": [{"name": "c", "description": "d", '
+        '"labels": [{"value": "x", "description": "d"}]}]}'
+    )
+
+    def run(*args):
+        monkeypatch.setattr(sys, "argv", ["classify.py", "--categories", str(cats), *map(str, args)])
+        cli.main()
+
+    return run
+
+
+def _workbook_for_cli(tmp_path):
+    return make_workbook(
+        tmp_path / "log.xlsx",
+        {
+            "Other": [["text"], ["not this one"]],
+            "Log": [
+                ["text", "id", "secret"],
+                ["alpha", "007", "S1"],
+                ["beta", "8", "S2"],
+            ],
+        },
+    )
+
+
+def test_cli_data_free_errors_exit_1_before_any_classifier_is_built(
+    tmp_path, monkeypatch, capsys, cli_env
+):
+    built = []
+    monkeypatch.setattr(
+        Classifier, "__init__", lambda self, *a, **k: built.append(1)
+    )
+    wb = _workbook_for_cli(tmp_path)
+    before = wb.read_bytes()
+    csv_in = _csv(tmp_path / "in.csv", text=["a"])
+
+    cases = [
+        (["-i", csv_in, "-c", "text", "-o", tmp_path / "o.csv", "--sheet", "S"], "--sheet only applies"),
+        (["-i", wb, "-c", "text"], "explicit --output"),
+        (["-i", csv_in, "-c", "text", "-o", tmp_path / "o.xlsx"], "must name a CSV"),
+    ]
+    for args, message in cases:
+        with pytest.raises(SystemExit) as exc:
+            cli_env(*args)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert message in out and "OVERWRITTEN" not in out
+    assert built == [] and wb.read_bytes() == before
+
+
+def test_cli_excel_in_csv_and_xlsx_out_with_keep_columns(tmp_path, cli_env):
+    wb = _workbook_for_cli(tmp_path)
+    out = tmp_path / "out.csv"
+    cli_env("-i", wb, "-c", "text", "-o", out, "--sheet", "Log",
+            "--keep-columns", "id", "--output-format", "xlsx")
+    df = pd.read_csv(out, dtype=str)
+    assert list(df.columns) == ["text", "id", "c"]
+    assert df["text"].tolist() == ["alpha", "beta"] and df["id"].tolist() == ["007", "8"]
+    _, rows = _reload(tmp_path / "out.xlsx")
+    assert rows[0] == ["text", "id", "c"] and "S1" not in str(rows)
+    assert (tmp_path / "out.cost_report.json").exists()
+    assert not (tmp_path / "out.xlsx.cost_report.json").exists()
+    assert json.loads((tmp_path / "out.cost_report.json").read_text())["schema_version"]
+
+
+def test_cli_default_output_format_writes_only_csv_and_cost_report(tmp_path, cli_env):
+    cli_env("-i", _csv(tmp_path / "in.csv", text=["a"]), "-c", "text", "-o", tmp_path / "out.csv")
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name != "cats.json") == [
+        "in.csv", "out.cost_report.json", "out.csv",
+    ]
+
+
+def test_cli_export_failure_keeps_csv_writes_cost_report_exits_1(
+    tmp_path, monkeypatch, capsys, cli_env
+):
+    def failing_save(self, filename):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(openpyxl.Workbook, "save", failing_save)
+    out = tmp_path / "out.csv"
+    with pytest.raises(SystemExit) as exc:
+        cli_env("-i", _csv(tmp_path / "in.csv", text=["a"]), "-c", "text", "-o", out,
+                "--output-format", "xlsx")
+    assert exc.value.code == 1
+    assert "Excel export failed" in capsys.readouterr().out
+    assert pd.read_csv(out)["c"].tolist() == ["['x']"]  # the CSV was kept
+    assert (tmp_path / "out.cost_report.json").exists()
+    assert not (tmp_path / "out.xlsx").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_cli_parser_exposes_the_new_flags():
+    ns = cli.build_parser().parse_args(["-i", "a.xlsx", "-c", "t", "-o", "o.csv"])
+    assert (ns.sheet, ns.keep_columns, ns.output_format) == (None, None, "csv")
+    ns = cli.build_parser().parse_args(
+        ["-i", "a.xlsx", "-c", "t", "--sheet", "2", "--keep-columns", "a,b", "--output-format", "xlsx"]
+    )
+    assert (ns.sheet, ns.keep_columns, ns.output_format) == ("2", "a,b", "xlsx")
