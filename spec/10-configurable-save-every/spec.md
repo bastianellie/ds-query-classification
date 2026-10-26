@@ -1,5 +1,9 @@
 # Spec 10: Configurable Save Frequency (`--save-every`)
 
+> **Status: CLOSED** — Implemented and verified on 2026-10-26.
+> Implementation summary: `spec/10-configurable-save-every/implementation-summary.md`
+> Merged from worktree branch `spec/10-configurable-save-every` on 2026-10-26.
+
 ## Overview
 
 `classify_csv` rewrites the whole output CSV every `save_every` completed rows (default 20), but
