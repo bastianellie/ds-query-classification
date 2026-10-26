@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "litellm",
     "pandas",
+    "openpyxl",
     "pydantic>=2",
     "python-dotenv",
     "tqdm",
