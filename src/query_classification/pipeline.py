@@ -14,7 +14,7 @@ from typing import Any
 import pandas as pd
 from tqdm import tqdm
 
-from query_classification import cost, debate, multi_model
+from query_classification import cost, debate, multi_model, table_io
 from query_classification.batching import BatchRunner
 from query_classification.categories import Category
 from query_classification.classifier import Classifier
@@ -42,6 +42,16 @@ def _classify_tracked(classifier: Classifier, text: str):
         return result, sink.usage
 
 
+def _export_xlsx(df: pd.DataFrame, output_path: Path, output_format: str) -> None:
+    """Write the optional ``.xlsx`` sibling of the final CSV (spec 9 FR-3.2).
+
+    Called exactly once per run, after the last CSV write, on every return path
+    -- never during the incremental saves.
+    """
+    if output_format == "xlsx":
+        table_io.write_xlsx(df, output_path.with_suffix(".xlsx"), output_path)
+
+
 def classify_csv(
     input_path: str | Path,
     column: str,
@@ -62,8 +72,12 @@ def classify_csv(
     batch_runner: BatchRunner | None = None,
     cost_collector: "cost.QueryCostCollector | None" = None,
     cost_per_token: "cost.CostPerToken | None" = None,
+    sheet: str | None = None,
+    keep_columns: list[str] | None = None,
+    output_format: str = "csv",
 ) -> Path:
-    """Classify ``column`` of the input CSV and write the augmented CSV.
+    """Classify ``column`` of the input CSV (or Excel sheet) and write the
+    augmented CSV.
 
     Rows are classified concurrently across ``workers`` threads (LLM calls are
     I/O-bound). Results are written back by row index, so the output preserves
@@ -85,10 +99,18 @@ def classify_csv(
     independently, merged by plurality vote; mutually exclusive with
     ``critics``.
 
-    Returns the path the result was written to. Defaults to overwriting the
-    input file when ``output_path`` is not given.
+    ``input_path`` may be a CSV or an ``.xlsx``/``.xlsm`` workbook (``sheet``
+    picks the worksheet; Excel input requires an explicit ``output_path``).
+    ``keep_columns`` limits which input columns are carried into the output
+    (the text ``column`` is always kept). Rows whose text is null/empty/blank
+    are not classified and keep null labels. With ``output_format="xlsx"`` an
+    ``.xlsx`` copy of the final CSV is also written once, at the end.
+
+    Returns the path the CSV result was written to. Defaults to overwriting
+    the input file when ``output_path`` is not given (CSV input only).
     """
     input_path = Path(input_path)
+    requested_output = output_path
     output_path = Path(output_path) if output_path else input_path
     category_names = [cat.name for cat in categories]
 
@@ -98,6 +120,8 @@ def classify_csv(
             f"classified. Rename the category or choose a different --column; "
             f"otherwise the source text would be overwritten before classification."
         )
+
+    table_io.validate_options(input_path, requested_output, sheet, output_format)
 
     have_classifier = classifier is not None
     have_models = models is not None
@@ -176,11 +200,29 @@ def classify_csv(
                     )
                 owner[col] = cat_name
 
-    df = pd.read_csv(input_path)
+    df = table_io.read_table(
+        input_path, sheet=sheet, keep_columns=keep_columns, text_column=column
+    )
     if column not in df.columns:
         raise ValueError(
             f"Column '{column}' not found. Available columns: {list(df.columns)}"
         )
+    if keep_columns is not None:
+        generated_cols = {
+            col
+            for cat_name in category_names
+            for col in {cat_name, *_audit_columns(cat_name, audit_suffixes)}
+        }
+        collisions = sorted(set(df.columns) & generated_cols)
+        if collisions:
+            raise ValueError(
+                f"--keep-columns includes {collisions}, which this run generates "
+                f"as category/audit output column(s). Drop them from --keep-columns "
+                f"or rename the category."
+            )
+    if output_format == "xlsx":
+        table_io.check_row_limit(len(df))
+    blank_text = table_io.blank_text_mask(df[column])
 
     # Add category columns (and, under --critics/--models, their audit
     # columns) if not present.
@@ -234,6 +276,14 @@ def classify_csv(
                 df[col] = df[col].astype(object)
         df.loc[work_idx, reset_cols] = None
 
+    # Rows with no query text are never sent to the LLM (they used to go out as
+    # the string "nan"). Excluding them before `limit` keeps `--limit` counting
+    # only classifiable rows; they stay in the output with null labels.
+    skipped_blank = int(blank_text.loc[work_idx].sum())
+    if skipped_blank:
+        work_idx = work_idx[~blank_text.loc[work_idx].to_numpy()]
+        print(f"Skipped {skipped_blank} rows with empty text")
+
     if limit is not None:
         work_idx = work_idx[:limit]
 
@@ -281,6 +331,7 @@ def classify_csv(
                         df.to_csv(output_path, index=False)
             df.to_csv(output_path, index=False)
             progress.close()
+            _export_xlsx(df, output_path, output_format)
             return output_path
 
         if critics:
@@ -355,4 +406,5 @@ def classify_csv(
 
     df.to_csv(output_path, index=False)
     progress.close()
+    _export_xlsx(df, output_path, output_format)
     return output_path

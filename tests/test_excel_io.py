@@ -308,3 +308,227 @@ def test_write_xlsx_failure_raises_cleans_temp_and_keeps_old_file(tmp_path, monk
         write_xlsx(pd.DataFrame({"text": ["a"]}), out, tmp_path / "o.csv")
     assert out.read_bytes() == b"old"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["o.xlsx"]
+
+
+# --- Task 2: classify_csv integration ---------------------------------------
+
+from query_classification import Category, Label, classify_csv  # noqa: E402
+
+CATS = [Category(name="label", description="d", labels=[Label(value="x", description="d")])]
+
+
+class _FakeClassifier:
+    """Stands in for `Classifier`: records the texts it is asked to classify."""
+
+    def __init__(self, on_call=None):
+        self.calls = []
+        self.on_call = on_call
+
+    def classify(self, text):
+        self.calls.append(text)
+        if self.on_call:
+            self.on_call(text)
+        return {"label": ["x"]}
+
+
+def _csv(path, **cols):
+    pd.DataFrame(cols).to_csv(path, index=False)
+    return path
+
+
+def test_csv_and_xlsx_input_classify_identically(tmp_path):
+    rows = [["text", "id"], ["hello", "007"], ["world", "8"]]
+    pd.DataFrame(rows[1:], columns=rows[0]).to_csv(tmp_path / "t.csv", index=False)
+    make_workbook(tmp_path / "t.xlsx", {"S": rows})
+    out_csv = classify_csv(tmp_path / "t.csv", "text", _FakeClassifier(), CATS, output_path=tmp_path / "a.csv")
+    out_xlsx = classify_csv(tmp_path / "t.xlsx", "text", _FakeClassifier(), CATS, output_path=tmp_path / "b.csv")
+    a, b = pd.read_csv(out_csv, dtype=str), pd.read_csv(out_xlsx, dtype=str)
+    assert a["label"].tolist() == b["label"].tolist() == ["['x']", "['x']"]
+    assert b["id"].tolist() == ["007", "8"]  # not reinterpreted as 7 / 8
+
+
+def test_old_style_call_is_unchanged(tmp_path):
+    src = _csv(tmp_path / "in.csv", text=["a", "b"], other=[1, 2])
+    out = classify_csv(src, "text", _FakeClassifier(), CATS, output_path=tmp_path / "out.csv")
+    df = pd.read_csv(out)
+    assert list(df.columns) == ["text", "other", "label"]
+    assert not list(tmp_path.glob("*.xlsx"))
+
+
+def test_sheet_with_csv_input_raises_before_any_classification(tmp_path):
+    src = _csv(tmp_path / "in.csv", text=["a"])
+    fake = _FakeClassifier()
+    with pytest.raises(ValueError, match="--sheet only applies"):
+        classify_csv(src, "text", fake, CATS, output_path=tmp_path / "o.csv", sheet="S")
+    assert fake.calls == []
+
+
+def test_excel_input_without_output_never_overwrites_the_workbook(tmp_path):
+    wb = make_workbook(tmp_path / "t.xlsx", {"S": [["text"], ["a"]]})
+    before = wb.read_bytes()
+    fake = _FakeClassifier()
+    with pytest.raises(ValueError, match="explicit --output"):
+        classify_csv(wb, "text", fake, CATS)
+    assert wb.read_bytes() == before and fake.calls == []
+
+
+def test_output_path_with_excel_suffix_is_rejected(tmp_path):
+    src = _csv(tmp_path / "in.csv", text=["a"])
+    fake = _FakeClassifier()
+    with pytest.raises(ValueError, match="must name a CSV"):
+        classify_csv(src, "text", fake, CATS, output_path=tmp_path / "o.xlsx")
+    assert fake.calls == []
+
+
+def test_blank_text_rows_are_skipped_kept_in_order_and_not_retried(tmp_path, capsys):
+    src = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["a", None, "b", "", "   "], "id": [1, 2, 3, 4, 5]}).to_csv(src, index=False)
+    fake = _FakeClassifier()
+    out = classify_csv(src, "text", fake, CATS, output_path=tmp_path / "out.csv")
+    assert sorted(fake.calls) == ["a", "b"]
+    assert "Skipped 3 rows with empty text" in capsys.readouterr().out
+    df = pd.read_csv(out)
+    assert df["id"].tolist() == [1, 2, 3, 4, 5]
+    assert df["label"].isna().tolist() == [False, True, False, True, True]
+    again = _FakeClassifier()
+    classify_csv(src, "text", again, CATS, output_path=out, restore=True)
+    assert again.calls == []
+
+
+def test_restore_limit_counts_only_remaining_classifiable_rows(tmp_path):
+    src = _csv(tmp_path / "in.csv", text=[None, "a", "b", "c"])
+    out = tmp_path / "out.csv"
+    first = _FakeClassifier()
+    classify_csv(src, "text", first, CATS, output_path=out, limit=1)
+    assert first.calls == ["a"]
+    second = _FakeClassifier()
+    classify_csv(src, "text", second, CATS, output_path=out, restore=True, limit=1)
+    assert second.calls == ["b"]
+
+
+def test_xlsx_with_interior_and_trailing_empty_rows_restores_by_position(tmp_path):
+    wb = make_workbook(
+        tmp_path / "t.xlsx",
+        {"S": [["text"], ["a"], [None], ["b"], ["c"], [None], [None]]},
+    )
+    out = tmp_path / "out.csv"
+    classify_csv(wb, "text", _FakeClassifier(), CATS, output_path=out, limit=1)
+    assert len(pd.read_csv(out)) == 4  # trailing empty rows are not part of the sheet
+    rest = _FakeClassifier()
+    classify_csv(wb, "text", rest, CATS, output_path=out, restore=True)
+    assert sorted(rest.calls) == ["b", "c"]
+    assert pd.read_csv(out)["label"].isna().tolist() == [False, True, False, False]
+
+
+def test_xlsx_missing_text_column_and_header_only_sheet(tmp_path):
+    wb = make_workbook(tmp_path / "t.xlsx", {"S": [["other"], ["a"]]})
+    with pytest.raises(ValueError, match="Column 'text' not found"):
+        classify_csv(wb, "text", _FakeClassifier(), CATS, output_path=tmp_path / "o.csv")
+    empty = make_workbook(tmp_path / "e.xlsx", {"S": [["text", "id"]]})
+    fake = _FakeClassifier()
+    out = classify_csv(empty, "text", fake, CATS, output_path=tmp_path / "e.csv")
+    assert fake.calls == [] and list(pd.read_csv(out).columns) == ["text", "id", "label"]
+    assert len(pd.read_csv(out)) == 0
+
+
+def test_restore_with_wrong_length_prior_output_still_raises(tmp_path):
+    wb = make_workbook(tmp_path / "t.xlsx", {"S": [["text"], ["a"], ["b"]]})
+    prior = _csv(tmp_path / "out.csv", text=["a"], label=["['x']"])
+    with pytest.raises(ValueError, match="Cannot restore"):
+        classify_csv(wb, "text", _FakeClassifier(), CATS, output_path=prior, restore=True)
+
+
+def test_keep_columns_limits_output_and_collision_is_rejected(tmp_path):
+    src = _csv(tmp_path / "in.csv", a=[1], b=[2], text=["x"], label=["old"])
+    out = classify_csv(
+        src, "text", _FakeClassifier(), CATS, output_path=tmp_path / "o.csv", keep_columns=["a"]
+    )
+    assert list(pd.read_csv(out).columns) == ["a", "text", "label"]
+    fake = _FakeClassifier()
+    with pytest.raises(ValueError, match="generates"):
+        classify_csv(
+            src, "text", fake, CATS, output_path=tmp_path / "o2.csv", keep_columns=["label"]
+        )
+    assert fake.calls == []
+    # without the flag the pre-existing behavior is unchanged: the column is reused
+    classify_csv(src, "text", _FakeClassifier(), CATS, output_path=tmp_path / "o3.csv")
+
+
+def test_unknown_keep_column_makes_zero_calls(tmp_path):
+    src = _csv(tmp_path / "in.csv", a=[1], text=["x"])
+    fake = _FakeClassifier()
+    with pytest.raises(ValueError, match="zzz"):
+        classify_csv(src, "text", fake, CATS, output_path=tmp_path / "o.csv", keep_columns=["a", "zzz"])
+    assert fake.calls == []
+
+
+def test_dropped_columns_never_reach_any_written_file(tmp_path):
+    src = tmp_path / "in.csv"
+    pd.DataFrame({"text": ["a", "b", "c"], "secret": ["SENTINEL-1", "SENTINEL-2", "SENTINEL-3"]}).to_csv(
+        src, index=False
+    )
+    out = tmp_path / "out.csv"
+    snapshots = []
+
+    def snapshot(_text):
+        if out.exists():
+            snapshots.append(out.read_text())
+
+    classify_csv(
+        src, "text", _FakeClassifier(on_call=snapshot), CATS, output_path=out,
+        save_every=1, workers=1, keep_columns=["text"], output_format="xlsx",
+    )
+    texts = [out.read_text(), *snapshots]
+    assert not any("SENTINEL" in t for t in texts)
+    _, rows = _reload(tmp_path / "out.xlsx")
+    assert "secret" not in rows[0]
+
+
+def test_xlsx_export_happens_once_after_the_final_csv(tmp_path):
+    src = _csv(tmp_path / "in.csv", text=["=1+1", "b", "c"])
+    out = tmp_path / "out.csv"
+    seen = []
+
+    def watch(_text):
+        seen.append(sorted(p.name for p in tmp_path.iterdir()))
+
+    classify_csv(
+        src, "text", _FakeClassifier(on_call=watch), CATS, output_path=out,
+        save_every=1, workers=1, output_format="xlsx",
+    )
+    assert all("out.xlsx" not in names for names in seen)
+    ws, rows = _reload(tmp_path / "out.xlsx")
+    csv_df = pd.read_csv(out, dtype=str)
+    assert [r[0] for r in rows[1:]] == csv_df["text"].tolist()  # incl. the literal "=1+1"
+    assert ws["A2"].data_type == "s"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["in.csv", "out.csv", "out.xlsx"]
+
+
+def test_xlsx_export_also_happens_on_the_batch_path(monkeypatch, tmp_path):
+    from tests.test_batching import _make_batch_runner
+
+    runner, _stats, categories = _make_batch_runner(monkeypatch, mode="fixed", fixed_size=2)
+    src = _csv(tmp_path / "in.csv", text=["q1", "q2", "q3"])
+    out = classify_csv(
+        src, "text", None, categories, output_path=tmp_path / "out.csv",
+        batch_runner=runner, output_format="xlsx",
+    )
+    _, rows = _reload(out.with_suffix(".xlsx"))
+    assert len(rows) == 4 and rows[0] == ["text", "c"]
+
+
+def test_row_limit_fails_fast_with_zero_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(table_io, "EXCEL_MAX_ROWS", 3)
+    src = _csv(tmp_path / "in.csv", text=["a", "b", "c", "d"])
+    fake = _FakeClassifier()
+    with pytest.raises(ValueError, match="Excel sheet"):
+        classify_csv(src, "text", fake, CATS, output_path=tmp_path / "o.csv", output_format="xlsx")
+    assert fake.calls == []
+    classify_csv(src, "text", fake, CATS, output_path=tmp_path / "o.csv")  # CSV is unaffected
+    assert len(fake.calls) == 4
+
+
+def test_invalid_output_format_is_rejected(tmp_path):
+    src = _csv(tmp_path / "in.csv", text=["a"])
+    with pytest.raises(ValueError, match="--output-format"):
+        classify_csv(src, "text", _FakeClassifier(), CATS, output_path=tmp_path / "o.csv", output_format="parquet")
