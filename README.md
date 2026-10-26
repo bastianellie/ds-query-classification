@@ -204,9 +204,12 @@ python classify.py \
 
 | Flag | Description |
 | --- | --- |
-| `-i, --input` | Input CSV file (required). |
+| `-i, --input` | Input CSV or Excel (`.xlsx`/`.xlsm`) file (required). |
 | `-c, --column` | Name of the text column to classify (required). |
-| `-o, --output` | Output CSV file. **Omitting it overwrites the input in place.** |
+| `-o, --output` | Output CSV file (always a CSV, even with `--output-format xlsx`). **Omitting it overwrites a CSV input in place; it is required for Excel input.** |
+| `--sheet` | Excel input only: worksheet to read, by exact name (checked first) or zero-based index (default: the first sheet). Errors with a list of the available sheet names if neither matches. |
+| `--keep-columns` | Comma-separated input columns to carry into the output; the `--column` text column is always kept. Default: all input columns. Dropped columns are never written (for Excel they are not even loaded). Unknown names fail before any LLM call. Names containing commas cannot be selected. |
+| `--output-format` | `csv` (default) or `xlsx`. `xlsx` additionally writes `<output stem>.xlsx` next to the CSV once the run finishes (see below). |
 | `--categories` | Categories JSON file (default: bundled example). |
 | `--model` | LiteLLM model id (default: `azure/gpt-5-chat`). Accepts exactly one value — use `--models` for multiple, or `--n-classifiers` to replicate this one model into several independent classifier instances. |
 | `--api-base` | Override the API endpoint/base URL (default: resolved from the first of `LITELLM_API_BASE`, `AZURE_API_BASE`, `AZURE_OPENAI_ENDPOINT`, `OPENAI_BASE_URL`, `OPENAI_API_BASE` that is set). |
@@ -231,6 +234,45 @@ python classify.py \
 | `--batch-max-size` | Hard cap on rows per batch regardless of token budget (default: 50). Requires `--batch`. |
 | `--batch-max-input-tokens` | Override the resolved input token budget used to size batches. Requires `--batch`. |
 | `--batch-max-output-tokens` | Override the resolved output token budget used as a runaway-response guard. Requires `--batch`. |
+
+### Excel input and output
+
+`--input` accepts `.xlsx`/`.xlsm` workbooks directly (legacy `.xls` is not supported — re-save as
+`.xlsx`). Only the parsed cell values of the selected sheet are used: macros, formulas (their
+cached values are read), formatting, hidden sheets, and workbook metadata are discarded. Cells
+are read without type coercion, so ID-like strings such as `007` stay `007`.
+
+```bash
+python classify.py \
+  --input logs/august.xlsx --sheet Sheet1 --column GENAI_INPUT \
+  --keep-columns CONVERSATION_ID,TIMESTAMP \
+  --output output/august_classified.csv \
+  --categories resources/categories/writing_intent.json
+```
+
+- **`--output` is required for Excel input** and must name a CSV, so the workbook is never
+  overwritten. The CSV is the working format: it is rewritten incrementally and is what
+  `--restore` reads.
+- **`--output-format xlsx`** also writes `<output stem>.xlsx` (one sheet named `Classified`) once,
+  after the final CSV — never during the run. The write is atomic (temp file, then rename). If it
+  fails, the CSV is kept, the cost report is still written, and the command exits with code 1.
+  Strings in the `.xlsx` are stored as literal text (a query like `=1+1` is not turned into a
+  formula), characters Excel cannot store are dropped and cells over 32,767 characters are
+  truncated (a one-line summary is printed); the CSV is always written verbatim, so a CSV opened
+  in a spreadsheet application can still interpret values starting with `=`, `+`, `-` or `@`.
+  A sheet holds at most 1,048,575 data rows; larger inputs are rejected up front.
+- **Rows with an empty query** (null, empty, or whitespace-only after reading — this applies to CSV
+  input too) are not sent to the LLM. They stay in the output, in place, with empty labels, and
+  `--limit` counts only classifiable rows. A line `Skipped N rows with empty text` is printed.
+- **`--restore` re-reads the whole workbook on every run**, and matches prior labels to rows purely
+  by position (plus a row-count check). Resuming with a different `--sheet`, `--keep-columns`, or an
+  edited input of the same length silently pairs old labels with the current rows, and carried
+  columns always come from the current input. Keep those fixed across a resumed run.
+- **Large workbooks are slow to read** (about a minute for a 145 MB / 629k-row log with `--keep-columns`) and the whole table is
+  held in memory during the run; `--output-format xlsx` additionally needs a temporary file of about
+  the workbook's size on the output volume.
+- Duplicate header cells are disambiguated by pandas (`a`, `a.1`), and `--keep-columns a` selects
+  only the first.
 
 ## Cost and timing
 
@@ -426,6 +468,7 @@ src/query_classification/
   schema.py       # build the dynamic Pydantic output model + schema text
   prompts.py      # render the system prompt
   classifier.py   # single-text LLM classification (Classifier)
+  table_io.py     # CSV/Excel table reading, --keep-columns, optional .xlsx export
   pipeline.py     # CSV batch loop (restore / limit / incremental save)
   debate.py       # --critics: sampling, consensus voting, Critic/Reconciler debate
   multi_model.py  # --models/--n-classifiers: N-classifier plurality-vote classification/audit trail
@@ -437,7 +480,7 @@ src/query_classification/
 resources/
   categories/     # example category definitions
   prompts/        # system/critic/reconciler/induction prompt templates + example task descriptions
-tests/            # unit tests for the offline building blocks
+tests/            # unit tests for the offline building blocks (incl. test_excel_io.py)
 ```
 
 Use it as a library, too:
