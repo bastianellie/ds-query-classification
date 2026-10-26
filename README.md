@@ -220,6 +220,7 @@ python classify.py \
 | `--restore` | Skip rows that already have labels; resume a previous run. |
 | `--retries N` | Retry attempts per row on LLM error (default: 3). |
 | `--workers N` | Concurrent worker threads for LLM calls (default: 8). |
+| `--save-every N` | Rewrite the output CSV every N completed rows (default: 20; must be >= 1). Every save rewrites the whole file, so see the note below for large inputs. With `--batch`, a save happens at most once per batch, when the completed count crossed a multiple of N during that batch. |
 | `--critics` | Enable self-consistency sampling + Critic/Reconciler debate mode (see below). |
 | `--sampling-runs N` | Independent samples per row under `--critics` (default: 5). |
 | `--sampling-temperature T` | Sampling temperature for `--critics` (default: 0.7). |
@@ -234,6 +235,20 @@ python classify.py \
 | `--batch-max-size` | Hard cap on rows per batch regardless of token budget (default: 50). Requires `--batch`. |
 | `--batch-max-input-tokens` | Override the resolved input token budget used to size batches. Requires `--batch`. |
 | `--batch-max-output-tokens` | Override the resolved output token budget used as a runaway-response guard. Requires `--batch`. |
+
+### Saving progress on large inputs
+
+The output CSV is rewritten in full every `--save-every` completed rows (default 20) so that a
+crashed run can be resumed with `--restore`. That default suits small inputs. For inputs of
+hundreds of thousands of rows each rewrite takes seconds (about 2 s for a 629k-row, 210 MB file in
+one local measurement), so use a larger value such as `--save-every 5000`.
+
+- A crash loses the rows completed since the last save: up to N, or up to N plus one batch's rows
+  with `--batch`, because the save happens at a batch boundary. `--restore` then resumes from the
+  last saved file, as long as that file was not itself truncated by a crash in the middle of a write
+  (writes are not atomic).
+- A cloud-synced output folder (OneDrive, Dropbox) makes each save slower and can stall on sync, so
+  write the output to a local folder and copy the finished file afterwards.
 
 ### Excel input and output
 
