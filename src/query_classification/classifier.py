@@ -491,6 +491,36 @@ class Classifier:
         self._usage_lock = threading.Lock()
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
+        self._dropped_params_lock = threading.Lock()
+        self._dropped_params: set[str] = set()
+
+    def dropped_params(self) -> frozenset[str]:
+        """Entries from ``_DROPPABLE_PARAMS`` this instance has observed the
+        provider reject via ``UnsupportedParamsError``, across every
+        ``classify()`` call so far -- e.g. a reasoning model that rejects an
+        explicit ``temperature``. Empty until the first such rejection. See
+        ``_attempt_completion``'s parameter-drop ladder, which is the sole
+        writer of this state."""
+        with self._dropped_params_lock:
+            return frozenset(self._dropped_params)
+
+    def _record_dropped_param(self, param: str) -> None:
+        """Logs a warning the first time this instance observes ``param``
+        rejected -- never again for the same instance/param, so a run
+        classifying thousands of rows against a model that always rejects
+        ``temperature`` logs this once, not once per row. ``model_id`` is
+        not sensitive (unlike the raw exception text this module otherwise
+        never logs, per ``_log_classified_failure``'s docstring)."""
+        with self._dropped_params_lock:
+            first_time = param not in self._dropped_params
+            self._dropped_params.add(param)
+        if first_time:
+            logger.warning(
+                "Classifier(model_id=%r): provider rejected %r as unsupported; "
+                "dropping it for this and all future calls on this instance",
+                self.model_id,
+                param,
+            )
 
     def usage_totals(self) -> tuple[int, int]:
         """(prompt_tokens, completion_tokens) accumulated across every real
@@ -584,6 +614,7 @@ class Classifier:
             # bookkeeping.
             for param in _DROPPABLE_PARAMS:
                 if param in kwargs:
+                    self._record_dropped_param(param)
                     return self._attempt_completion(
                         {k: v for k, v in kwargs.items() if k != param}
                     )

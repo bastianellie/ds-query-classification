@@ -169,6 +169,68 @@ def test_droppable_params_drops_max_tokens_before_temperature(monkeypatch):
     assert "max_tokens" not in calls[2] and "temperature" not in calls[2]
 
 
+def test_dropped_params_recorded_on_classifier_instance(monkeypatch):
+    import litellm
+
+    def fake_completion(**kwargs):
+        if "temperature" in kwargs:
+            raise litellm.UnsupportedParamsError(
+                message="doesn't support temperature", model=kwargs.get("model", ""), llm_provider="openai"
+            )
+
+        class _Msg:
+            content = json.dumps({"c": ["x"]})
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    clf = _classifier(temperature=0.7)
+    assert clf.dropped_params() == frozenset()
+    clf._complete([{"role": "user", "content": "hi"}])
+    assert clf.dropped_params() == frozenset({"temperature"})
+
+
+def test_dropped_params_warning_logged_once_not_per_call(monkeypatch, caplog):
+    import logging
+
+    import litellm
+
+    def fake_completion(**kwargs):
+        if "temperature" in kwargs:
+            raise litellm.UnsupportedParamsError(
+                message="doesn't support temperature", model=kwargs.get("model", ""), llm_provider="openai"
+            )
+
+        class _Msg:
+            content = json.dumps({"c": ["x"]})
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    clf = _classifier(temperature=0.7)
+    with caplog.at_level(logging.WARNING, logger="query_classification.classifier"):
+        clf._complete([{"role": "user", "content": "hi"}])
+        clf._complete([{"role": "user", "content": "hi again"}])
+    drop_warnings = [r for r in caplog.records if "rejected" in r.getMessage()]
+    assert len(drop_warnings) == 1
+    assert "temperature" in drop_warnings[0].getMessage()
+    assert clf.model_id in drop_warnings[0].getMessage()
+
+
 # ---------------------------------------------------------------------------
 # AR-2.3: delimiter equality with induction.py
 # ---------------------------------------------------------------------------

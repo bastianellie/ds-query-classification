@@ -91,6 +91,15 @@ def validate_options(
             f"--output must name a CSV file, got '{output_path}'. Use "
             f"--output-format xlsx to also get an .xlsx export next to the CSV."
         )
+    if output_path:
+        # Fail before any LLM call: otherwise the first incremental save raises an
+        # uncaught OSError after the whole run has already been paid for. The
+        # directory is never auto-created (same stance as extract_categories.py).
+        out = Path(output_path)
+        if out.is_dir():
+            raise ValueError(f"--output '{out}' is a directory, not a file")
+        if not out.parent.is_dir():
+            raise FileNotFoundError(f"--output parent directory does not exist: {out.parent}")
     return excel_input
 
 
